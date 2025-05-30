@@ -17,6 +17,54 @@ def filter_and_sort_data(df: pd.DataFrame, audit_leader: str, column_mapping: Di
             break
     
     if audit_leader_col is None:
+        logger.error("Could not find Audit Leader column in DataFrame")
+        return df, False
+    
+    # Filter rows for this audit leader
+    filtered_df = df[df[audit_leader_col] == audit_leader].copy()
+    logger.info(f"Filtered to {len(filtered_df)} rows for audit leader: {audit_leader}")
+    
+    if len(filtered_df) == 0:
+        return filtered_df, False
+    
+    # Find the Overall Test Result column (handling newlines in column names)
+    result_col_name = None
+    
+    # Look for column with newline-separated text matching our target
+    target_text = "overall test result (after considering any applicable test result overrides)"
+    
+    for col_name in filtered_df.columns:
+        # Normalize the column name: remove newlines, extra spaces, convert to lowercase
+        normalized_col = ' '.join(str(col_name).replace('\n', ' ').split()).lower()
+        
+        if normalized_col == target_text:
+            result_col_name = col_name
+            logger.info(f"Found target result column: '{col_name}' (normalized: '{normalized_col}')")
+            break
+    
+    # Fallback: look for column containing key phrases and NOT containing "override"
+    if result_col_name is None:
+        for col_name in filtered_df.columns:
+            normalized_col = ' '.join(str(col_name).replace('\n', ' ').split()).lower()
+            if ("def filter_and_sort_data(df: pd.DataFrame, audit_leader: str, column_mapping: Dict[str, int]) -> Tuple[pd.DataFrame, bool]:
+    """
+    Filter data for specific audit leader and sort with DNC values first.
+    
+    Returns:
+        Tuple of (filtered_df, has_dnc_values)
+    """
+    # Filter for the specific audit leader
+    if "Audit Leader" not in column_mapping:
+        logger.error("'Audit Leader' column not found in column mapping")
+        return df, False
+    
+    audit_leader_col = None
+    for col_name in df.columns:
+        if "Audit Leader" in str(col_name):
+            audit_leader_col = col_name
+            break
+    
+    if audit_leader_col is None:
         logger.error("Could not find Audit Leader column in DataFrame")import os
 import shutil
 import re
@@ -270,7 +318,7 @@ def analyze_workbook_structure(workbook_path: str) -> Tuple[Set[str], Dict[str, 
     
     Returns:
         Tuple of (audit_leaders_set, sheet_info_dict)
-        where sheet_info_dict maps sheet_name -> (header_row, data_start_row, data_end_row, max_col, column_mapping)
+        where sheet_info_dict maps sheet_name -> (header_row, data_start_row, data_end_row, max_col, column_mapping, result_col_name)
     """
     audit_leaders = set()
     sheet_info = {}
@@ -291,14 +339,45 @@ def analyze_workbook_structure(workbook_path: str) -> Tuple[Set[str], Dict[str, 
                 header_row, data_start_row, data_end_row, max_col = boundaries
                 column_mapping = get_column_mapping(sheet, header_row, max_col)
                 
-                # Store sheet info for reuse
-                sheet_info[sheet_name] = (header_row, data_start_row, data_end_row, max_col, column_mapping)
+                # Extract data to identify result column and audit leaders
+                df = extract_data_to_dataframe(sheet, header_row, data_start_row, data_end_row, max_col)
                 
-                # Find Audit Leader column
+                # Find the correct result column once
+                result_col_name = None
+                target_text = "overall test result (after considering any applicable test result overrides)"
+                
+                for col_name in df.columns:
+                    # Normalize the column name: remove newlines, extra spaces, convert to lowercase
+                    normalized_col = ' '.join(str(col_name).replace('\n', ' ').split()).lower()
+                    
+                    if normalized_col == target_text:
+                        result_col_name = col_name
+                        logger.info(f"Found target result column in {sheet_name}: '{col_name}'")
+                        break
+                
+                # Fallback: look for column containing key phrases and NOT containing "override"
+                if result_col_name is None:
+                    for col_name in df.columns:
+                        normalized_col = ' '.join(str(col_name).replace('\n', ' ').split()).lower()
+                        if ("overall test result" in normalized_col and 
+                            "considering" in normalized_col and 
+                            "applicable" in normalized_col and
+                            "override" not in normalized_col):
+                            result_col_name = col_name
+                            logger.info(f"Found fallback result column in {sheet_name}: '{col_name}'")
+                            break
+                
+                if result_col_name is None:
+                    logger.warning(f"Could not find result column in {sheet_name}")
+                
+                # Store sheet info including the result column for reuse
+                sheet_info[sheet_name] = (header_row, data_start_row, data_end_row, max_col, column_mapping, result_col_name)
+                
+                # Find Audit Leader column and extract unique values
                 audit_leader_col = None
                 for col_name, col_num in column_mapping.items():
                     if "Audit Leader" in col_name:
-                        audit_leader_col = col_num
+                        audit_leader_col = col_name
                         break
                 
                 if audit_leader_col is None:
@@ -306,9 +385,8 @@ def analyze_workbook_structure(workbook_path: str) -> Tuple[Set[str], Dict[str, 
                     continue
                 
                 # Extract unique audit leaders from this sheet
-                for row_num in range(data_start_row, data_end_row + 1):
-                    leader_value = sheet.cell(row=row_num, column=audit_leader_col).value
-                    if leader_value and str(leader_value).strip():
+                for leader_value in df[audit_leader_col].dropna().unique():
+                    if str(leader_value).strip():
                         audit_leaders.add(str(leader_value).strip())
         
         wb.close()
