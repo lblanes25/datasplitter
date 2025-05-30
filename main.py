@@ -1,71 +1,4 @@
-def filter_and_sort_data(df: pd.DataFrame, audit_leader: str, column_mapping: Dict[str, int]) -> Tuple[pd.DataFrame, bool]:
-    """
-    Filter data for specific audit leader and sort with DNC values first.
-    
-    Returns:
-        Tuple of (filtered_df, has_dnc_values)
-    """
-    # Filter for the specific audit leader
-    if "Audit Leader" not in column_mapping:
-        logger.error("'Audit Leader' column not found in column mapping")
-        return df, False
-    
-    audit_leader_col = None
-    for col_name in df.columns:
-        if "Audit Leader" in str(col_name):
-            audit_leader_col = col_name
-            break
-    
-    if audit_leader_col is None:
-        logger.error("Could not find Audit Leader column in DataFrame")
-        return df, False
-    
-    # Filter rows for this audit leader
-    filtered_df = df[df[audit_leader_col] == audit_leader].copy()
-    logger.info(f"Filtered to {len(filtered_df)} rows for audit leader: {audit_leader}")
-    
-    if len(filtered_df) == 0:
-        return filtered_df, False
-    
-    # Find the Overall Test Result column (handling newlines in column names)
-    result_col_name = None
-    
-    # Look for column with newline-separated text matching our target
-    target_text = "overall test result (after considering any applicable test result overrides)"
-    
-    for col_name in filtered_df.columns:
-        # Normalize the column name: remove newlines, extra spaces, convert to lowercase
-        normalized_col = ' '.join(str(col_name).replace('\n', ' ').split()).lower()
-        
-        if normalized_col == target_text:
-            result_col_name = col_name
-            logger.info(f"Found target result column: '{col_name}' (normalized: '{normalized_col}')")
-            break
-    
-    # Fallback: look for column containing key phrases and NOT containing "override"
-    if result_col_name is None:
-        for col_name in filtered_df.columns:
-            normalized_col = ' '.join(str(col_name).replace('\n', ' ').split()).lower()
-            if ("def filter_and_sort_data(df: pd.DataFrame, audit_leader: str, column_mapping: Dict[str, int]) -> Tuple[pd.DataFrame, bool]:
-    """
-    Filter data for specific audit leader and sort with DNC values first.
-    
-    Returns:
-        Tuple of (filtered_df, has_dnc_values)
-    """
-    # Filter for the specific audit leader
-    if "Audit Leader" not in column_mapping:
-        logger.error("'Audit Leader' column not found in column mapping")
-        return df, False
-    
-    audit_leader_col = None
-    for col_name in df.columns:
-        if "Audit Leader" in str(col_name):
-            audit_leader_col = col_name
-            break
-    
-    if audit_leader_col is None:
-        logger.error("Could not find Audit Leader column in DataFrame")import os
+import os
 import shutil
 import re
 from pathlib import Path
@@ -217,100 +150,107 @@ def finalize_sheet_presentation(sheet):
     except Exception as e:
         logger.warning(f"Could not finalize presentation for sheet {sheet.title}: {str(e)}")
         # Don't fail the whole process if presentation cleanup fails
-def write_dataframe_to_sheet(sheet, df: pd.DataFrame, data_start_row: int, data_end_row: int, max_col: int):
-    """
-    Replace existing data rows with filtered DataFrame data by deleting rows and inserting new ones.
-    """
-    # Step 1: Delete all existing data rows (from bottom to top to avoid index shifting)
-    rows_to_delete = data_end_row - data_start_row + 1
-    for i in range(rows_to_delete):
-        sheet.delete_rows(data_start_row)
-    
-    # Step 2: Insert new rows for the filtered data
-    for idx, row in df.iterrows():
-        excel_row = data_start_row + idx
-        sheet.insert_rows(excel_row)
-        
-        # Write the data to the new row
-        for col_idx, value in enumerate(row):
-            if col_idx < max_col:  # Don't exceed original column range
-                sheet.cell(row=excel_row, column=col_idx + 1).value = value
 
-def filter_and_sort_data(df: pd.DataFrame, audit_leader: str, column_mapping: Dict[str, int]) -> Tuple[pd.DataFrame, bool]:
+def get_result_column_number(sheet, header_row: int, max_col: int) -> Optional[int]:
+    """Find the result column number using the same logic as before."""
+    target_text = "overall test result (after considering any applicable test result overrides)"
+    
+    for col_num in range(1, max_col + 1):
+        header_value = sheet.cell(row=header_row, column=col_num).value
+        if header_value:
+            normalized_col = ' '.join(str(header_value).replace('\n', ' ').split()).lower()
+            if normalized_col == target_text:
+                return col_num
+    
+    # Fallback logic
+    for col_num in range(1, max_col + 1):
+        header_value = sheet.cell(row=header_row, column=col_num).value
+        if header_value:
+            normalized_col = ' '.join(str(header_value).replace('\n', ' ').split()).lower()
+            if ("overall test result" in normalized_col and 
+                "considering" in normalized_col and 
+                "applicable" in normalized_col and
+                "override" not in normalized_col):
+                return col_num
+    
+    return None
+
+def get_audit_leader_column_number(column_mapping: Dict[str, int]) -> int:
+    """Find the column number for Audit Leader."""
+    for col_name, col_num in column_mapping.items():
+        if "Audit Leader" in col_name:
+            return col_num
+    raise ValueError("Audit Leader column not found in column mapping")
+
+def sort_sheet_by_dnc(sheet, header_row: int, data_start_row: int, data_end_row: int, result_col_num: int):
     """
-    Filter data for specific audit leader and sort with DNC values first.
+    Sort all data in the sheet to put DNC values first, regardless of audit leader.
+    This is done once per sheet before any filtering.
+    """
+    if not result_col_num:
+        logger.info("No result column found - skipping DNC sorting")
+        return
+    
+    # Read all row data
+    dnc_rows = []
+    non_dnc_rows = []
+    
+    for row_num in range(data_start_row, data_end_row + 1):
+        # Read entire row
+        row_data = []
+        for col_num in range(1, sheet.max_column + 1):
+            cell_value = sheet.cell(row=row_num, column=col_num).value
+            row_data.append(cell_value)
+        
+        # Check if this row has DNC in the result column
+        result_value = sheet.cell(row=row_num, column=result_col_num).value
+        if result_value and "DNC" in str(result_value).upper():
+            dnc_rows.append(row_data)
+        else:
+            non_dnc_rows.append(row_data)
+    
+    # Combine: DNC rows first, then non-DNC rows
+    sorted_data = dnc_rows + non_dnc_rows
+    
+    # Write sorted data back to sheet
+    for idx, row_data in enumerate(sorted_data):
+        excel_row = data_start_row + idx
+        for col_idx, value in enumerate(row_data):
+            sheet.cell(row=excel_row, column=col_idx + 1).value = value
+    
+    logger.info(f"Sorted sheet: {len(dnc_rows)} DNC rows moved to top, {len(non_dnc_rows)} non-DNC rows below")
+
+def filter_rows_by_audit_leader(sheet, audit_leader: str, data_start_row: int, data_end_row: int, audit_leader_col_num: int, result_col_num: int = None) -> bool:
+    """
+    Simple filtering: delete rows that don't match the audit leader.
+    Assumes data is already sorted with DNC values first.
     
     Returns:
-        Tuple of (filtered_df, has_dnc_values)
+        bool: True if any DNC values remain after filtering
     """
-    # Filter for the specific audit leader
-    if "Audit Leader" not in column_mapping:
-        logger.error("'Audit Leader' column not found in column mapping")
-        return df, False
+    rows_to_delete = []
+    has_dnc_remaining = False
     
-    audit_leader_col = None
-    for col_name in df.columns:
-        if "Audit Leader" in str(col_name):
-            audit_leader_col = col_name
-            break
-    
-    if audit_leader_col is None:
-        logger.error("Could not find Audit Leader column in DataFrame")
-        return df, False
-    
-    # Filter rows for this audit leader
-    filtered_df = df[df[audit_leader_col] == audit_leader].copy()
-    logger.info(f"Filtered to {len(filtered_df)} rows for audit leader: {audit_leader}")
-    
-    if len(filtered_df) == 0:
-        return filtered_df, False
-    
-    # Debug: Print all column names to help identify the exact column
-    logger.info(f"Available columns: {list(filtered_df.columns)}")
-    
-    # Find the Overall Test Result column using positional logic
-    result_col_name = None
-    
-    # Step 1: Find the "Override" column first
-    override_col_index = None
-    for idx, col_name in enumerate(filtered_df.columns):
-        col_lower = str(col_name).lower()
-        if "overall test result override" in col_lower:
-            override_col_index = idx
-            logger.info(f"Found Override column at index {idx}: '{col_name}'")
-            break
-    
-    # Step 2: Get the column immediately to the right
-    if override_col_index is not None and override_col_index + 1 < len(filtered_df.columns):
-        result_col_name = filtered_df.columns[override_col_index + 1]
-        logger.info(f"Using column to the right of Override: '{result_col_name}'")
-    else:
-        logger.error("Could not find Override column or no column to its right")
-        return filtered_df, False
-    
-    # Check for DNC values in the identified column
-    has_dnc = False
-    if result_col_name in filtered_df.columns:
-        dnc_count = filtered_df[result_col_name].astype(str).str.contains("DNC", case=False, na=False).sum()
-        if dnc_count > 0:
-            has_dnc = True
-            logger.info(f"Found {dnc_count} DNC values in '{result_col_name}' column")
-        else:
-            logger.info(f"No DNC values found in '{result_col_name}' column")
-    
-    # Sort with DNC values first
-    if has_dnc:
-        # Create a sort key that prioritizes DNC values
-        def sort_key(row):
-            if result_col_name in row and "DNC" in str(row[result_col_name]):
-                return 0  # DNC values get priority
-            return 1  # Non-DNC values come after
+    # Identify rows to delete and check for remaining DNC values
+    for row_num in range(data_start_row, data_end_row + 1):
+        audit_leader_cell = sheet.cell(row=row_num, column=audit_leader_col_num).value
         
-        filtered_df['_sort_key'] = filtered_df.apply(sort_key, axis=1)
-        filtered_df = filtered_df.sort_values('_sort_key').drop('_sort_key', axis=1)
-        logger.info("Sorted data with DNC values first")
+        if str(audit_leader_cell).strip() == audit_leader:
+            # This row matches - check if it has DNC
+            if result_col_num:
+                result_cell = sheet.cell(row=row_num, column=result_col_num).value
+                if result_cell and "DNC" in str(result_cell).upper():
+                    has_dnc_remaining = True
+        else:
+            # This row doesn't match - mark for deletion
+            rows_to_delete.append(row_num)
     
-    return filtered_df, has_dnc
+    # Delete non-matching rows (from bottom to top to avoid index shifting)
+    for row_num in reversed(rows_to_delete):
+        sheet.delete_rows(row_num)
+    
+    logger.info(f"Filtered sheet: deleted {len(rows_to_delete)} non-matching rows, DNC remaining: {has_dnc_remaining}")
+    return has_dnc_remaining
 
 def analyze_workbook_structure(workbook_path: str) -> Tuple[Set[str], Dict[str, Tuple]]:
     """
@@ -398,9 +338,49 @@ def analyze_workbook_structure(workbook_path: str) -> Tuple[Set[str], Dict[str, 
     logger.info(f"Analyzed {len(sheet_info)} QA-ID sheets")
     return audit_leaders, sheet_info
 
+def pre_sort_workbook_by_dnc(source_file: str) -> str:
+    """
+    Create a pre-sorted version of the workbook with DNC values at the top of each sheet.
+    This sorted file will be used as the base for all audit leader filtering.
+    
+    Returns:
+        Path to the pre-sorted workbook
+    """
+    source_path = Path(source_file)
+    sorted_filename = f"{source_path.stem}_sorted_dnc{source_path.suffix}"
+    sorted_path = source_path.parent / sorted_filename
+    
+    # Copy original file
+    shutil.copyfile(source_file, sorted_path)
+    logger.info(f"Created pre-sort copy: {sorted_path}")
+    
+    # Analyze structure
+    audit_leaders, sheet_info = analyze_workbook_structure(source_file)
+    
+    # Open the copied file and sort each sheet
+    wb = openpyxl.load_workbook(sorted_path, data_only=False)
+    
+    for sheet_name, (header_row, data_start_row, data_end_row, max_col, column_mapping, result_col_name) in sheet_info.items():
+        logger.info(f"Sorting sheet by DNC: {sheet_name}")
+        sheet = wb[sheet_name]
+        
+        # Get result column number
+        result_col_num = get_result_column_number(sheet, header_row, max_col)
+        
+        # Sort this sheet by DNC
+        sort_sheet_by_dnc(sheet, header_row, data_start_row, data_end_row, result_col_num)
+    
+    # Save the pre-sorted workbook
+    wb.save(sorted_path)
+    wb.close()
+    logger.info(f"Pre-sorted workbook saved: {sorted_path}")
+    
+    return str(sorted_path)
+
 def process_workbook_by_audit_leaders(source_file: str, output_dir: str = None) -> Dict[str, str]:
     """
     Process an Excel workbook to create filtered versions for each audit leader.
+    Optimized approach: Sort once by DNC, then filter many times by audit leader.
     
     Args:
         source_file: Path to the source Excel file
@@ -419,10 +399,9 @@ def process_workbook_by_audit_leaders(source_file: str, output_dir: str = None) 
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
     
-    # Get the base filename without extension
     base_name = source_path.stem
     
-    # OPTIMIZATION: Analyze workbook structure once
+    # Step 1: Analyze workbook structure
     logger.info("Analyzing workbook structure...")
     audit_leaders, sheet_info = analyze_workbook_structure(source_file)
     
@@ -434,36 +413,41 @@ def process_workbook_by_audit_leaders(source_file: str, output_dir: str = None) 
         logger.warning("No QA-ID sheets with valid table structure found")
         return {}
     
+    # Step 2: Create pre-sorted workbook (DNC values first)
+    logger.info("Pre-sorting workbook by DNC values...")
+    sorted_workbook_path = pre_sort_workbook_by_dnc(source_file)
+    
     results = {}
     
-    # Process each audit leader using pre-analyzed structure
+    # Step 3: Process each audit leader using the pre-sorted workbook
     for audit_leader in sorted(audit_leaders):
         logger.info(f"Processing workbook for audit leader: {audit_leader}")
         
         try:
-            # Step 1: Copy the original file
+            # Copy the pre-sorted file (not the original)
             safe_leader_name = sanitize_filename(audit_leader)
             output_filename = f"{base_name} - {safe_leader_name}.xlsx"
             output_path = output_dir / output_filename
-            shutil.copyfile(source_file, output_path)
-            logger.info(f"Created copy: {output_path}")
+            shutil.copyfile(sorted_workbook_path, output_path)
+            logger.info(f"Created copy from pre-sorted file: {output_path}")
             
-            # Step 2: Open the copied file
+            # Open the copied file
             wb = openpyxl.load_workbook(output_path, data_only=False)
             
-            # Step 3: Process each QA-ID sheet using pre-analyzed info
-            for sheet_name, (header_row, data_start_row, data_end_row, max_col, column_mapping) in sheet_info.items():
-                logger.info(f"Processing sheet: {sheet_name}")
+            # Process each QA-ID sheet (simple filtering only)
+            for sheet_name, (header_row, data_start_row, data_end_row, max_col, column_mapping, result_col_name) in sheet_info.items():
+                logger.info(f"Filtering sheet: {sheet_name}")
                 sheet = wb[sheet_name]
                 
-                # Extract data to DataFrame using known boundaries
-                df = extract_data_to_dataframe(sheet, header_row, data_start_row, data_end_row, max_col)
+                # Get column numbers
+                audit_leader_col_num = get_audit_leader_column_number(column_mapping)
+                result_col_num = get_result_column_number(sheet, header_row, max_col)
                 
-                # Filter and sort data
-                filtered_df, has_dnc = filter_and_sort_data(df, audit_leader, column_mapping)
-                
-                # Write filtered data back to sheet
-                write_dataframe_to_sheet(sheet, filtered_df, data_start_row, data_end_row, max_col)
+                # Simple filter by audit leader (no sorting needed - already done)
+                has_dnc = filter_rows_by_audit_leader(
+                    sheet, audit_leader, data_start_row, data_end_row, 
+                    audit_leader_col_num, result_col_num
+                )
                 
                 # Set tab color based on DNC presence
                 if has_dnc:
@@ -473,12 +457,12 @@ def process_workbook_by_audit_leaders(source_file: str, output_dir: str = None) 
                     sheet.sheet_properties.tabColor = "00FF00"  # Green
                     logger.info(f"Set {sheet_name} tab color to green (no DNC values)")
             
-            # Step 4: Finalize all sheets for better presentation
+            # Finalize all sheets
             for sheet_name in wb.sheetnames:
                 sheet = wb[sheet_name]
                 finalize_sheet_presentation(sheet)
             
-            # Step 5: Save the processed workbook
+            # Save the processed workbook
             wb.save(output_path)
             wb.close()
             
@@ -487,9 +471,15 @@ def process_workbook_by_audit_leaders(source_file: str, output_dir: str = None) 
             
         except Exception as e:
             logger.error(f"Error processing workbook for {audit_leader}: {str(e)}")
-            # Clean up partial file if it exists
             if output_path.exists():
                 output_path.unlink()
+    
+    # Step 4: Clean up the temporary pre-sorted file
+    try:
+        Path(sorted_workbook_path).unlink()
+        logger.info("Cleaned up temporary pre-sorted file")
+    except Exception as e:
+        logger.warning(f"Could not clean up temporary file {sorted_workbook_path}: {str(e)}")
     
     logger.info(f"Processing complete. Created {len(results)} workbooks.")
     return results
