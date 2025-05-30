@@ -182,18 +182,16 @@ def get_audit_leader_column_number(column_mapping: Dict[str, int]) -> int:
             return col_num
     raise ValueError("Audit Leader column not found in column mapping")
 
-def sort_sheet_by_dnc(sheet, header_row: int, data_start_row: int, data_end_row: int, result_col_num: int):
+def sort_sheet_by_audit_leader_and_dnc(sheet, header_row: int, data_start_row: int, data_end_row: int, 
+                                      audit_leader_col: int, result_col_num: int = None):
     """
-    Sort all data in the sheet to put DNC values first, regardless of audit leader.
-    This is done once per sheet before any filtering.
+    Sort all data in the sheet by audit leader first, then DNC within each leader.
+    This groups all rows for each audit leader together, making filtering much faster.
     """
-    if not result_col_num:
-        logger.info("No result column found - skipping DNC sorting")
-        return
+    logger.info(f"Sorting sheet by audit leader and DNC...")
     
-    # Read all row data
-    dnc_rows = []
-    non_dnc_rows = []
+    # Read all row data with sort keys
+    all_rows_with_keys = []
     
     for row_num in range(data_start_row, data_end_row + 1):
         # Read entire row
@@ -202,15 +200,27 @@ def sort_sheet_by_dnc(sheet, header_row: int, data_start_row: int, data_end_row:
             cell_value = sheet.cell(row=row_num, column=col_num).value
             row_data.append(cell_value)
         
-        # Check if this row has DNC in the result column
-        result_value = sheet.cell(row=row_num, column=result_col_num).value
-        if result_value and "DNC" in str(result_value).upper():
-            dnc_rows.append(row_data)
-        else:
-            non_dnc_rows.append(row_data)
+        # Get audit leader for sorting
+        audit_leader = sheet.cell(row=row_num, column=audit_leader_col).value
+        audit_leader_str = str(audit_leader or "").strip()
+        
+        # Get DNC status for secondary sorting
+        has_dnc = False
+        if result_col_num:
+            result_value = sheet.cell(row=row_num, column=result_col_num).value
+            has_dnc = result_value and "DNC" in str(result_value).upper()
+        
+        # Create sort key: (audit_leader, not has_dnc)
+        # not has_dnc because we want DNC=True to sort first (False < True)
+        sort_key = (audit_leader_str, not has_dnc)
+        
+        all_rows_with_keys.append((sort_key, row_data))
     
-    # Combine: DNC rows first, then non-DNC rows
-    sorted_data = dnc_rows + non_dnc_rows
+    # Sort by the sort key
+    all_rows_with_keys.sort(key=lambda x: x[0])
+    
+    # Extract just the row data in sorted order
+    sorted_data = [row_data for sort_key, row_data in all_rows_with_keys]
     
     # Write sorted data back to sheet
     for idx, row_data in enumerate(sorted_data):
@@ -218,51 +228,98 @@ def sort_sheet_by_dnc(sheet, header_row: int, data_start_row: int, data_end_row:
         for col_idx, value in enumerate(row_data):
             sheet.cell(row=excel_row, column=col_idx + 1).value = value
     
-    logger.info(f"Sorted sheet: {len(dnc_rows)} DNC rows moved to top, {len(non_dnc_rows)} non-DNC rows below")
+    # Create summary of the sort
+    audit_leader_counts = {}
+    for sort_key, _ in all_rows_with_keys:
+        leader = sort_key[0]
+        audit_leader_counts[leader] = audit_leader_counts.get(leader, 0) + 1
+    
+    logger.info(f"Sorted {len(sorted_data)} rows by audit leader:")
+    for leader, count in sorted(audit_leader_counts.items()):
+        if count > 0:  # Only show leaders with data
+            logger.info(f"  {leader}: {count} rows")
 
-def filter_rows_by_audit_leader(sheet, audit_leader: str, data_start_row: int, data_end_row: int, audit_leader_col_num: int, result_col_num: int = None) -> bool:
+def find_audit_leader_boundaries(sheet, data_start_row: int, data_end_row: int, 
+                                audit_leader_col: int, target_leader: str) -> Tuple[Optional[int], Optional[int]]:
     """
-    Simple filtering: delete rows that don't match the audit leader.
-    Assumes data is already sorted with DNC values first.
+    Find the start and end rows for a specific audit leader in a sorted sheet.
+    Assumes the sheet has been sorted by audit leader.
+    """
+    start_row = None
+    end_row = None
+    
+    for row_num in range(data_start_row, data_end_row + 1):
+        audit_leader = sheet.cell(row=row_num, column=audit_leader_col).value
+        audit_leader_str = str(audit_leader or "").strip()
+        
+        if audit_leader_str == target_leader:
+            if start_row is None:
+                start_row = row_num
+            end_row = row_num
+        elif start_row is not None:
+            # We've moved past this audit leader's section
+            break
+    
+    if start_row is None:
+        logger.warning(f"No rows found for audit leader: {target_leader}")
+        return None, None
+    
+    logger.info(f"Found {target_leader} in rows {start_row} to {end_row} ({end_row - start_row + 1} rows)")
+    return start_row, end_row
+
+def filter_sheet_by_bulk_delete(sheet, audit_leader: str, data_start_row: int, data_end_row: int, 
+                               audit_leader_col: int, result_col_num: int = None) -> bool:
+    """
+    Filter sheet using bulk deletions after sorting.
+    Much faster than deleting individual rows.
     
     Returns:
         bool: True if any DNC values remain after filtering
     """
-    rows_to_delete = []
-    has_dnc_remaining = False
+    # Find where this audit leader's data is located
+    leader_start, leader_end = find_audit_leader_boundaries(
+        sheet, data_start_row, data_end_row, audit_leader_col, audit_leader
+    )
     
-    # Identify rows to delete and check for remaining DNC values
-    for row_num in range(data_start_row, data_end_row + 1):
-        audit_leader_cell = sheet.cell(row=row_num, column=audit_leader_col_num).value
-        
-        if str(audit_leader_cell).strip() == audit_leader:
-            # This row matches - check if it has DNC
-            if result_col_num:
-                result_cell = sheet.cell(row=row_num, column=result_col_num).value
-                if result_cell and "DNC" in str(result_cell).upper():
-                    has_dnc_remaining = True
-        else:
-            # This row doesn't match - mark for deletion
-            rows_to_delete.append(row_num)
+    if leader_start is None:
+        # No rows for this audit leader - delete all data
+        total_rows = data_end_row - data_start_row + 1
+        if total_rows > 0:
+            sheet.delete_rows(data_start_row, total_rows)
+            logger.info(f"No data found for {audit_leader} - deleted all {total_rows} data rows")
+        return False
     
-    logger.info(f"Found {len(rows_to_delete)} rows to delete for audit leader: {audit_leader}")
+    # Check for DNC values in the remaining data
+    has_dnc = False
+    if result_col_num:
+        for row_num in range(leader_start, leader_end + 1):
+            result_value = sheet.cell(row=row_num, column=result_col_num).value
+            if result_value and "DNC" in str(result_value).upper():
+                has_dnc = True
+                break
     
-    # Delete non-matching rows (from bottom to top to avoid index shifting)
-    # Process in batches to show progress for large deletions
-    batch_size = 50
-    total_deleted = 0
+    # Perform bulk deletions
+    deletions_made = 0
     
-    for i in range(0, len(rows_to_delete), batch_size):
-        batch = rows_to_delete[i:i + batch_size]
-        for row_num in reversed(batch):  # Still delete from bottom to top within batch
-            sheet.delete_rows(row_num)
-            total_deleted += 1
-        
-        if len(rows_to_delete) > batch_size:
-            logger.info(f"Deleted {total_deleted}/{len(rows_to_delete)} rows...")
+    # Delete everything after this audit leader's data
+    rows_after = data_end_row - leader_end
+    if rows_after > 0:
+        sheet.delete_rows(leader_end + 1, rows_after)
+        deletions_made += rows_after
+        logger.info(f"Deleted {rows_after} rows after {audit_leader}'s data")
     
-    logger.info(f"Filtered sheet: deleted {len(rows_to_delete)} non-matching rows, DNC remaining: {has_dnc_remaining}")
-    return has_dnc_remaining
+    # Delete everything before this audit leader's data
+    rows_before = leader_start - data_start_row
+    if rows_before > 0:
+        sheet.delete_rows(data_start_row, rows_before)
+        deletions_made += rows_before
+        logger.info(f"Deleted {rows_before} rows before {audit_leader}'s data")
+    
+    remaining_rows = (leader_end - leader_start + 1)
+    logger.info(f"Filtering complete for {audit_leader}: {remaining_rows} rows remain, "
+               f"{deletions_made} rows deleted, DNC present: {has_dnc}")
+    
+    return has_dnc
 
 def analyze_workbook_structure(workbook_path: str) -> Tuple[Set[str], Dict[str, Tuple]]:
     """
@@ -350,39 +407,36 @@ def analyze_workbook_structure(workbook_path: str) -> Tuple[Set[str], Dict[str, 
     logger.info(f"Analyzed {len(sheet_info)} QA-ID sheets")
     return audit_leaders, sheet_info
 
-def pre_sort_workbook_by_dnc(source_file: str) -> str:
+def create_presorted_workbook(source_file: str, audit_leaders: set, sheet_info: dict) -> str:
     """
-    Create a pre-sorted version of the workbook with DNC values at the top of each sheet.
-    This sorted file will be used as the base for all audit leader filtering.
-    
-    Returns:
-        Path to the pre-sorted workbook
+    Create a workbook sorted by audit leader, then DNC.
+    This replaces the pre_sort_workbook_by_dnc function.
     """
     source_path = Path(source_file)
-    sorted_filename = f"{source_path.stem}_sorted_dnc{source_path.suffix}"
+    sorted_filename = f"{source_path.stem}_sorted_by_leader{source_path.suffix}"
     sorted_path = source_path.parent / sorted_filename
     
     # Copy original file
     shutil.copyfile(source_file, sorted_path)
     logger.info(f"Created pre-sort copy: {sorted_path}")
     
-    # Analyze structure
-    audit_leaders, sheet_info = analyze_workbook_structure(source_file)
-    
-    # Open the copied file and sort each sheet
+    # Open and sort each sheet
     wb = openpyxl.load_workbook(sorted_path, data_only=False)
     
     for sheet_name, (header_row, data_start_row, data_end_row, max_col, column_mapping, result_col_name) in sheet_info.items():
-        logger.info(f"Sorting sheet by DNC: {sheet_name}")
+        logger.info(f"Sorting sheet by audit leader: {sheet_name}")
         sheet = wb[sheet_name]
         
-        # Get result column number
+        # Get column numbers
+        audit_leader_col_num = get_audit_leader_column_number(column_mapping)
         result_col_num = get_result_column_number(sheet, header_row, max_col)
         
-        # Sort this sheet by DNC
-        sort_sheet_by_dnc(sheet, header_row, data_start_row, data_end_row, result_col_num)
+        # Sort by audit leader, then DNC
+        sort_sheet_by_audit_leader_and_dnc(
+            sheet, header_row, data_start_row, data_end_row,
+            audit_leader_col_num, result_col_num
+        )
     
-    # Save the pre-sorted workbook
     wb.save(sorted_path)
     wb.close()
     logger.info(f"Pre-sorted workbook saved: {sorted_path}")
@@ -392,7 +446,7 @@ def pre_sort_workbook_by_dnc(source_file: str) -> str:
 def process_workbook_by_audit_leaders(source_file: str, output_dir: str = None) -> Dict[str, str]:
     """
     Process an Excel workbook to create filtered versions for each audit leader.
-    Optimized approach: Sort once by DNC, then filter many times by audit leader.
+    Optimized approach: Sort by audit leader first, then use bulk deletions for filtering.
     
     Args:
         source_file: Path to the source Excel file
@@ -425,9 +479,9 @@ def process_workbook_by_audit_leaders(source_file: str, output_dir: str = None) 
         logger.warning("No QA-ID sheets with valid table structure found")
         return {}
     
-    # Step 2: Create pre-sorted workbook (DNC values first)
-    logger.info("Pre-sorting workbook by DNC values...")
-    sorted_workbook_path = pre_sort_workbook_by_dnc(source_file)
+    # Step 2: Create pre-sorted workbook (sorted by audit leader, then DNC)
+    logger.info("Pre-sorting workbook by audit leader and DNC values...")
+    sorted_workbook_path = create_presorted_workbook(source_file, audit_leaders, sheet_info)
     
     results = {}
     
@@ -453,7 +507,7 @@ def process_workbook_by_audit_leaders(source_file: str, output_dir: str = None) 
             except Exception as e:
                 logger.warning(f"Could not disable calculation mode: {e}")
             
-            # Process each QA-ID sheet (simple filtering only)
+            # Process each QA-ID sheet using bulk deletion
             for sheet_name, (header_row, data_start_row, data_end_row, max_col, column_mapping, result_col_name) in sheet_info.items():
                 logger.info(f"Filtering sheet: {sheet_name}")
                 sheet = wb[sheet_name]
@@ -462,8 +516,8 @@ def process_workbook_by_audit_leaders(source_file: str, output_dir: str = None) 
                 audit_leader_col_num = get_audit_leader_column_number(column_mapping)
                 result_col_num = get_result_column_number(sheet, header_row, max_col)
                 
-                # Simple filter by audit leader (no sorting needed - already done)
-                has_dnc = filter_rows_by_audit_leader(
+                # Filter using bulk deletion (MUCH faster than individual row deletion)
+                has_dnc = filter_sheet_by_bulk_delete(
                     sheet, audit_leader, data_start_row, data_end_row, 
                     audit_leader_col_num, result_col_num
                 )
