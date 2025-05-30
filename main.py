@@ -1,291 +1,347 @@
-import pandas as pd
-import numpy as np
 import os
-import sys
-import traceback
-from openpyxl import load_workbook, Workbook
-from openpyxl.utils.dataframe import dataframe_to_rows
-from openpyxl.utils import get_column_letter
-from openpyxl.styles import PatternFill, Font
+import shutil
+from pathlib import Path
+import pandas as pd
+import openpyxl
+from openpyxl.styles import PatternFill
+from typing import Dict, List, Tuple, Optional, Set
+import logging
 
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
-def is_qa_id_sheet(sheet_name):
-    if not isinstance(sheet_name, str):
-        return False
-    return sheet_name.upper().startswith('QA-ID-')
-
-
-def find_data_table_header_row(workbook_path, sheet_name):
+def find_table_boundaries(sheet, sheet_name: str) -> Optional[Tuple[int, int, int, int]]:
+    """
+    Find the data table boundaries in a QA-ID sheet.
+    
+    Returns:
+        Tuple of (header_row, data_start_row, data_end_row, max_col) or None if not found
+    """
     try:
-        df_no_header = pd.read_excel(workbook_path, sheet_name=sheet_name, header=None)
-        col_b = df_no_header.iloc[:, 1] if len(df_no_header.columns) > 1 else pd.Series()
-
+        # Step 1: Find "Detailed Results" in column B
         detailed_results_row = None
-        audit_leader_row = None
-
-        for idx, value in col_b.items():
-            if pd.notna(value) and isinstance(value, str):
-                if 'detailed results' in value.lower():
-                    detailed_results_row = idx
-                    print(f"    Found 'Detailed Results' at row {idx + 1}")
-                    break
-
+        for row_num in range(1, sheet.max_row + 1):
+            cell_value = sheet.cell(row=row_num, column=2).value
+            if cell_value and "Detailed Results" in str(cell_value):
+                detailed_results_row = row_num
+                logger.info(f"Found 'Detailed Results' at row {row_num} in {sheet_name}")
+                break
+        
         if detailed_results_row is None:
-            print(f"    Could not find 'Detailed Results' in column B")
+            logger.warning(f"Could not find 'Detailed Results' in column B for sheet {sheet_name}")
             return None
-
-        for idx in range(detailed_results_row + 1, len(col_b)):
-            value = col_b.iloc[idx] if idx < len(col_b) else None
-            if pd.notna(value) and isinstance(value, str):
-                if value.strip().lower() == 'audit leader':
-                    audit_leader_row = idx
-                    print(f"    Found 'Audit Leader' header at row {idx + 1}")
-                    break
-
+        
+        # Step 2: Find "Audit Leader" in column B after "Detailed Results"
+        audit_leader_row = None
+        for row_num in range(detailed_results_row + 1, sheet.max_row + 1):
+            cell_value = sheet.cell(row=row_num, column=2).value
+            if cell_value and "Audit Leader" in str(cell_value):
+                audit_leader_row = row_num
+                logger.info(f"Found 'Audit Leader' at row {row_num} in {sheet_name}")
+                break
+        
         if audit_leader_row is None:
-            print(f"    Could not find 'Audit Leader' after 'Detailed Results'")
+            logger.warning(f"Could not find 'Audit Leader' in column B after 'Detailed Results' for sheet {sheet_name}")
             return None
-
-        return audit_leader_row
-
+        
+        # Step 3: Determine data boundaries
+        header_row = audit_leader_row
+        data_start_row = header_row + 1
+        
+        # Find the end of data by looking for first completely empty row
+        data_end_row = sheet.max_row
+        for row_num in range(data_start_row, sheet.max_row + 1):
+            row_has_data = False
+            for col_num in range(1, sheet.max_column + 1):
+                if sheet.cell(row=row_num, column=col_num).value is not None:
+                    row_has_data = True
+                    break
+            if not row_has_data:
+                data_end_row = row_num - 1
+                break
+        
+        # Find the actual max column used in the header row
+        max_col = 1
+        for col_num in range(1, sheet.max_column + 1):
+            if sheet.cell(row=header_row, column=col_num).value is not None:
+                max_col = col_num
+        
+        logger.info(f"Table boundaries for {sheet_name}: header_row={header_row}, data_start={data_start_row}, data_end={data_end_row}, max_col={max_col}")
+        return header_row, data_start_row, data_end_row, max_col
+        
     except Exception as e:
-        print(f"    Error finding header row: {e}")
+        logger.error(f"Error finding table boundaries in {sheet_name}: {str(e)}")
         return None
 
+def get_column_mapping(sheet, header_row: int, max_col: int) -> Dict[str, int]:
+    """
+    Create a mapping of column names to column numbers from the header row.
+    """
+    column_mapping = {}
+    for col_num in range(1, max_col + 1):
+        header_value = sheet.cell(row=header_row, column=col_num).value
+        if header_value:
+            column_mapping[str(header_value).strip()] = col_num
+    
+    logger.info(f"Column mapping: {column_mapping}")
+    return column_mapping
 
-def find_audit_leader_column(df):
-    for col in df.columns:
-        if isinstance(col, str) and col.strip().lower() == 'audit leader':
-            return col
-    for col in df.columns:
-        if isinstance(col, str) and 'audit leader' in col.lower():
-            return col
-    return None
+def extract_data_to_dataframe(sheet, header_row: int, data_start_row: int, data_end_row: int, max_col: int) -> pd.DataFrame:
+    """
+    Extract data from the sheet into a pandas DataFrame.
+    """
+    # Get headers
+    headers = []
+    for col_num in range(1, max_col + 1):
+        header_value = sheet.cell(row=header_row, column=col_num).value
+        headers.append(str(header_value) if header_value is not None else f"Column_{col_num}")
+    
+    # Get data
+    data = []
+    for row_num in range(data_start_row, data_end_row + 1):
+        row_data = []
+        for col_num in range(1, max_col + 1):
+            cell_value = sheet.cell(row=row_num, column=col_num).value
+            row_data.append(cell_value)
+        data.append(row_data)
+    
+    df = pd.DataFrame(data, columns=headers)
+    logger.info(f"Extracted DataFrame with shape {df.shape}")
+    return df
 
+def write_dataframe_to_sheet(sheet, df: pd.DataFrame, data_start_row: int, max_col: int):
+    """
+    Write DataFrame data back to the sheet, preserving formatting where possible.
+    """
+    # Clear existing data rows first
+    for row_num in range(data_start_row, sheet.max_row + 1):
+        for col_num in range(1, max_col + 1):
+            sheet.cell(row=row_num, column=col_num).value = None
+    
+    # Write new data
+    for idx, row in df.iterrows():
+        excel_row = data_start_row + idx
+        for col_idx, value in enumerate(row):
+            if col_idx < max_col:  # Don't exceed original column range
+                sheet.cell(row=excel_row, column=col_idx + 1).value = value
 
-def get_all_audit_leaders(workbook_path):
-    print(f"Opening workbook to get audit leaders: {workbook_path}")
-    all_leaders = set()
-    excel_file = pd.ExcelFile(workbook_path)
-    qa_sheets = [sheet for sheet in excel_file.sheet_names if is_qa_id_sheet(sheet)]
-    print(f"Found {len(qa_sheets)} QA-ID sheets to process: {qa_sheets}")
+def filter_and_sort_data(df: pd.DataFrame, audit_leader: str, column_mapping: Dict[str, int]) -> Tuple[pd.DataFrame, bool]:
+    """
+    Filter data for specific audit leader and sort with DNC values first.
+    
+    Returns:
+        Tuple of (filtered_df, has_dnc_values)
+    """
+    # Filter for the specific audit leader
+    if "Audit Leader" not in column_mapping:
+        logger.error("'Audit Leader' column not found in column mapping")
+        return df, False
+    
+    audit_leader_col = None
+    for col_name in df.columns:
+        if "Audit Leader" in str(col_name):
+            audit_leader_col = col_name
+            break
+    
+    if audit_leader_col is None:
+        logger.error("Could not find Audit Leader column in DataFrame")
+        return df, False
+    
+    # Filter rows for this audit leader
+    filtered_df = df[df[audit_leader_col] == audit_leader].copy()
+    logger.info(f"Filtered to {len(filtered_df)} rows for audit leader: {audit_leader}")
+    
+    if len(filtered_df) == 0:
+        return filtered_df, False
+    
+    # Check for DNC values and sort
+    has_dnc = False
+    qa_result_cols = []
+    
+    # Find QA Result and Override Result columns
+    for col_name in filtered_df.columns:
+        if any(keyword in str(col_name) for keyword in ["QA Result", "Override Result"]):
+            qa_result_cols.append(col_name)
+    
+    # Check for DNC values
+    for col_name in qa_result_cols:
+        if col_name in filtered_df.columns:
+            dnc_count = filtered_df[col_name].astype(str).str.contains("DNC", case=False, na=False).sum()
+            if dnc_count > 0:
+                has_dnc = True
+                logger.info(f"Found {dnc_count} DNC values in column {col_name}")
+    
+    # Sort with DNC values first
+    if qa_result_cols and has_dnc:
+        # Create a sort key that prioritizes DNC values
+        def sort_key(row):
+            for col_name in qa_result_cols:
+                if col_name in row and "DNC" in str(row[col_name]):
+                    return 0  # DNC values get priority
+            return 1  # Non-DNC values come after
+        
+        filtered_df['_sort_key'] = filtered_df.apply(sort_key, axis=1)
+        filtered_df = filtered_df.sort_values('_sort_key').drop('_sort_key', axis=1)
+        logger.info("Sorted data with DNC values first")
+    
+    return filtered_df, has_dnc
 
-    for sheet_name in qa_sheets:
-        print(f"  Scanning sheet: {sheet_name} for audit leaders")
+def get_unique_audit_leaders(workbook_path: str) -> Set[str]:
+    """
+    Extract all unique audit leaders from QA-ID sheets in the workbook.
+    """
+    audit_leaders = set()
+    
+    try:
+        wb = openpyxl.load_workbook(workbook_path, data_only=False)
+        
+        for sheet_name in wb.sheetnames:
+            if sheet_name.startswith("QA-ID-"):
+                logger.info(f"Scanning sheet {sheet_name} for audit leaders")
+                sheet = wb[sheet_name]
+                
+                # Find table boundaries
+                boundaries = find_table_boundaries(sheet, sheet_name)
+                if boundaries is None:
+                    continue
+                
+                header_row, data_start_row, data_end_row, max_col = boundaries
+                column_mapping = get_column_mapping(sheet, header_row, max_col)
+                
+                # Find Audit Leader column
+                audit_leader_col = None
+                for col_name, col_num in column_mapping.items():
+                    if "Audit Leader" in col_name:
+                        audit_leader_col = col_num
+                        break
+                
+                if audit_leader_col is None:
+                    logger.warning(f"Could not find Audit Leader column in {sheet_name}")
+                    continue
+                
+                # Extract unique audit leaders from this sheet
+                for row_num in range(data_start_row, data_end_row + 1):
+                    leader_value = sheet.cell(row=row_num, column=audit_leader_col).value
+                    if leader_value and str(leader_value).strip():
+                        audit_leaders.add(str(leader_value).strip())
+        
+        wb.close()
+        
+    except Exception as e:
+        logger.error(f"Error extracting audit leaders: {str(e)}")
+    
+    logger.info(f"Found unique audit leaders: {sorted(audit_leaders)}")
+    return audit_leaders
+
+def process_workbook_by_audit_leaders(source_file: str, output_dir: str = None) -> Dict[str, str]:
+    """
+    Process an Excel workbook to create filtered versions for each audit leader.
+    
+    Args:
+        source_file: Path to the source Excel file
+        output_dir: Directory to save output files (defaults to same directory as source)
+    
+    Returns:
+        Dictionary mapping audit leader names to output file paths
+    """
+    source_path = Path(source_file)
+    if not source_path.exists():
+        raise FileNotFoundError(f"Source file not found: {source_file}")
+    
+    if output_dir is None:
+        output_dir = source_path.parent
+    else:
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Get the base filename without extension
+    base_name = source_path.stem
+    
+    # Extract all unique audit leaders
+    logger.info("Extracting unique audit leaders from workbook...")
+    audit_leaders = get_unique_audit_leaders(source_file)
+    
+    if not audit_leaders:
+        logger.warning("No audit leaders found in the workbook")
+        return {}
+    
+    results = {}
+    
+    # Process each audit leader
+    for audit_leader in sorted(audit_leaders):
+        logger.info(f"Processing workbook for audit leader: {audit_leader}")
+        
         try:
-            header_row_idx = find_data_table_header_row(workbook_path, sheet_name)
-            if header_row_idx is not None:
-                df = pd.read_excel(excel_file, sheet_name=sheet_name,
-                                   skiprows=header_row_idx, header=0)
-                leader_col = find_audit_leader_column(df)
-                if leader_col:
-                    print(f"  Found leader column: {leader_col}")
-                    leaders = df[leader_col].dropna().astype(str).unique()
-                    leaders = [leader for leader in leaders if
-                               leader.strip() and leader.strip().lower() != 'audit leader']
-                    all_leaders.update(leaders)
-                    print(f"  Added {len(leaders)} leaders: {', '.join(leaders)}")
-                else:
-                    print(f"  Could not find audit leader column in sheet {sheet_name}")
-            else:
-                print(f"  Could not find data table in sheet {sheet_name}")
-        except Exception as e:
-            print(f"  Error processing sheet {sheet_name}: {e}")
-            traceback.print_exc()
-
-    leader_list = sorted(list(all_leaders))
-    print(f"Total unique audit leaders found: {len(leader_list)}")
-    print(f"Leaders: {', '.join(leader_list)}")
-    return leader_list
-
-
-def normalize_leader_name(name):
-    if not isinstance(name, str):
-        return str(name).lower().strip() if name is not None else ""
-    return name.lower().strip()
-
-
-def filter_data_for_leader(df, leader_col, leader_name):
-    if leader_col not in df.columns:
-        return pd.DataFrame()
-    normalized_leader = normalize_leader_name(leader_name)
-    normalized_col = df[leader_col].fillna("").astype(str).apply(normalize_leader_name)
-    filtered = df[normalized_col == normalized_leader].copy()
-    if filtered.empty:
-        filtered = df[normalized_col.str.contains(normalized_leader, na=False)].copy()
-    return filtered
-
-
-def copy_entire_sheet(source_sheet, target_sheet):
-    try:
-        print(f"    Copying entire sheet: {source_sheet.title}")
-        for row in source_sheet.iter_rows():
-            row_data = [cell.value for cell in row]
-            target_sheet.append(row_data)
-        for column in source_sheet.column_dimensions:
-            target_sheet.column_dimensions[column].width = source_sheet.column_dimensions[column].width
-        print(f"    Sheet copied successfully")
-    except Exception as e:
-        print(f"    Error copying sheet: {e}")
-        traceback.print_exc()
-
-
-def create_leader_workbook(input_path, output_path, leader_name):
-    print(f"\nProcessing workbook for: {leader_name}")
-    try:
-        print(f"  Loading original workbook: {input_path}")
-        original_wb = load_workbook(input_path)
-        new_wb = Workbook()
-
-        if "Sheet" in new_wb.sheetnames:
-            del new_wb["Sheet"]
-
-        found_data = False
-        sheets_with_dnc = set()
-
-        for sheet_name in original_wb.sheetnames:
-            print(f"  Processing sheet: {sheet_name}")
-            new_sheet = new_wb.create_sheet(title=sheet_name)
-
-            if is_qa_id_sheet(sheet_name):
-                print(f"    This is a QA-ID sheet - filtering for {leader_name}")
-                has_dnc = False
-                try:
-                    header_row_idx = find_data_table_header_row(input_path, sheet_name)
-                    if header_row_idx is not None:
-                        print(f"    Found data table header at row {header_row_idx + 1}")
-                        df = pd.read_excel(input_path, sheet_name=sheet_name,
-                                           skiprows=header_row_idx, header=0)
-                        leader_col = find_audit_leader_column(df)
-                        if leader_col:
-                            print(f"    Using column: {leader_col}")
-                            filtered_df = filter_data_for_leader(df, leader_col, leader_name)
-                            if not filtered_df.empty:
-                                print(f"    Found {len(filtered_df)} rows for {leader_name}")
-                                found_data = True
-                                qa_col = next((col for col in filtered_df.columns
-                                               if isinstance(col, str) and 'qa' in col.lower() and 'result' in col.lower()), None)
-                                if qa_col:
-                                    print(f"    Found QA Results column: {qa_col}")
-                                    dnc_rows = filtered_df[filtered_df[qa_col].astype(str).str.lower() == 'dnc']
-                                    if not dnc_rows.empty:
-                                        print(f"    ⚠️ Found {len(dnc_rows)} DNC results in this sheet!")
-                                        has_dnc = True
-                                        sheets_with_dnc.add(sheet_name)
-                                original_sheet = original_wb[sheet_name]
-                                for row_idx in range(1, header_row_idx + 2):
-                                    new_sheet.append([cell.value for cell in original_sheet[row_idx]])
-                                for _, row in filtered_df.iterrows():
-                                    new_sheet.append(row.tolist())
-                                for cell in new_sheet[header_row_idx + 1]:
-                                    cell.font = Font(bold=True)
-                                for i in range(1, len(row) + 1):
-                                    new_sheet.column_dimensions[get_column_letter(i)].width = 15
-                            else:
-                                print(f"    No data found for {leader_name} in sheet {sheet_name}")
-                                original_sheet = original_wb[sheet_name]
-                                for row_idx in range(1, min(header_row_idx + 10, len(list(original_sheet.rows))) + 1):
-                                    new_sheet.append([cell.value for cell in original_sheet[row_idx]])
-                        else:
-                            print(f"    Could not find audit leader column")
-                            original_sheet = original_wb[sheet_name]
-                            for row_idx in range(1, min(20, len(list(original_sheet.rows))) + 1):
-                                new_sheet.append([cell.value for cell in original_sheet[row_idx]])
+            # Step 1: Copy the original file
+            output_filename = f"{base_name} - {audit_leader}.xlsx"
+            output_path = output_dir / output_filename
+            shutil.copyfile(source_file, output_path)
+            logger.info(f"Created copy: {output_path}")
+            
+            # Step 2: Open the copied file
+            wb = openpyxl.load_workbook(output_path, data_only=False)
+            
+            # Step 3: Process each QA-ID sheet
+            for sheet_name in wb.sheetnames:
+                if sheet_name.startswith("QA-ID-"):
+                    logger.info(f"Processing sheet: {sheet_name}")
+                    sheet = wb[sheet_name]
+                    
+                    # Find table boundaries
+                    boundaries = find_table_boundaries(sheet, sheet_name)
+                    if boundaries is None:
+                        logger.warning(f"Skipping sheet {sheet_name} - could not find table boundaries")
+                        continue
+                    
+                    header_row, data_start_row, data_end_row, max_col = boundaries
+                    column_mapping = get_column_mapping(sheet, header_row, max_col)
+                    
+                    # Extract data to DataFrame
+                    df = extract_data_to_dataframe(sheet, header_row, data_start_row, data_end_row, max_col)
+                    
+                    # Filter and sort data
+                    filtered_df, has_dnc = filter_and_sort_data(df, audit_leader, column_mapping)
+                    
+                    # Write filtered data back to sheet
+                    write_dataframe_to_sheet(sheet, filtered_df, data_start_row, max_col)
+                    
+                    # Set tab color based on DNC presence
+                    if has_dnc:
+                        sheet.sheet_properties.tabColor = "FF0000"  # Red
+                        logger.info(f"Set {sheet_name} tab color to red (DNC values present)")
                     else:
-                        print(f"    Could not find data table header")
-                        original_sheet = original_wb[sheet_name]
-                        for row_idx in range(1, min(20, len(list(original_sheet.rows))) + 1):
-                            new_sheet.append([cell.value for cell in original_sheet[row_idx]])
-                except Exception as e:
-                    print(f"    Error processing QA-ID sheet {sheet_name}: {e}")
-                    traceback.print_exc()
-                    original_sheet = original_wb[sheet_name]
-                    for row_idx in range(1, min(15, len(list(original_sheet.rows))) + 1):
-                        try:
-                            new_sheet.append([cell.value for cell in original_sheet[row_idx]])
-                        except:
-                            break
-            else:
-                print(f"    This is not a QA-ID sheet - copying entirely")
-                try:
-                    original_sheet = original_wb[sheet_name]
-                    copy_entire_sheet(original_sheet, new_sheet)
-                except Exception as e:
-                    print(f"    Error copying non-QA-ID sheet {sheet_name}: {e}")
-                    traceback.print_exc()
+                        sheet.sheet_properties.tabColor = "00FF00"  # Green
+                        logger.info(f"Set {sheet_name} tab color to green (no DNC values)")
+            
+            # Step 4: Save the processed workbook
+            wb.save(output_path)
+            wb.close()
+            
+            results[audit_leader] = str(output_path)
+            logger.info(f"Successfully processed workbook for {audit_leader}")
+            
+        except Exception as e:
+            logger.error(f"Error processing workbook for {audit_leader}: {str(e)}")
+            # Clean up partial file if it exists
+            if output_path.exists():
+                output_path.unlink()
+    
+    logger.info(f"Processing complete. Created {len(results)} workbooks.")
+    return results
 
-        for sheet_name in new_wb.sheetnames:
-            sheet = new_wb[sheet_name]
-            if is_qa_id_sheet(sheet_name):
-                sheet.sheet_properties.tabColor = "FF0000" if sheet_name in sheets_with_dnc else "00FF00"
-                print(f"  {'🔴' if sheet_name in sheets_with_dnc else '🟢'} Tab for QA-ID sheet {sheet_name} colored")
-
-        print(f"  Saving workbook to: {output_path}")
-        new_wb.save(output_path)
-        return found_data
-
-    except Exception as e:
-        print(f"Error creating workbook for {leader_name}: {e}")
-        traceback.print_exc()
-        return False
-
-
-def split_audit_data(input_file, output_dir='audit_leaders'):
-    try:
-        if not os.path.exists(output_dir):
-            print(f"Creating output directory: {output_dir}")
-            os.makedirs(output_dir)
-        else:
-            print(f"Output directory already exists: {output_dir}")
-
-        audit_leaders = get_all_audit_leaders(input_file)
-        print(f"Found {len(audit_leaders)} audit leaders across QA-ID sheets")
-
-        success_count = 0
-        for leader in audit_leaders:
-            output_file = os.path.join(output_dir, f"{leader} Horizontal Review 2025.xlsx")
-            print(f"Creating file for {leader}...")
-            result = create_leader_workbook(input_file, output_file, leader)
-            if result:
-                success_count += 1
-                print(f"  Saved to {output_file}")
-            else:
-                print(f"  No data found for {leader}, but workbook created with structure")
-
-        print(f"\nCompleted: Created {success_count} files for {len(audit_leaders)} audit leaders!")
-        return True
-    except Exception as e:
-        print(f"Error in split_audit_data: {e}")
-        traceback.print_exc()
-        return False
-
-
+# Example usage
 if __name__ == "__main__":
-    print("Script starting...")
+    # Example usage
+    source_file = "your_workbook.xlsx"
+    output_directory = "output_files"
+    
     try:
-        import argparse
-
-        parser = argparse.ArgumentParser(description="Split audit data Excel file by audit leaders.")
-        parser.add_argument("-i", "--input", help="Path to input Excel file")
-        parser.add_argument("-o", "--output", help="Path to output directory")
-        args = parser.parse_args()
-
-        input_file = args.input or input("Enter path to Excel file: ").strip().strip('"\'')
-        if not os.path.exists(input_file):
-            print(f"ERROR: Input file not found at {input_file}")
-            sys.exit(1)
-
-        output_dir = args.output
-        if not output_dir:
-            output_dir = input("Enter output directory path (press Enter for default 'audit_leaders'): ").strip().strip('"\'')
-            if not output_dir:
-                output_dir = os.path.join(os.path.dirname(input_file), "audit_leaders")
-                print(f"Using default output directory: {output_dir}")
-
-        if split_audit_data(input_file, output_dir):
-            print("Script completed successfully!")
-        else:
-            print("Script completed with errors!")
+        results = process_workbook_by_audit_leaders(source_file, output_directory)
+        
+        print("Processing Results:")
+        for audit_leader, output_file in results.items():
+            print(f"  {audit_leader}: {output_file}")
+            
     except Exception as e:
-        print(f"ERROR: {str(e)}")
-        traceback.print_exc()
+        print(f"Error: {e}")
