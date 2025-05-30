@@ -116,18 +116,55 @@ def extract_data_to_dataframe(sheet, header_row: int, data_start_row: int, data_
     logger.info(f"Extracted DataFrame with shape {df.shape}")
     return df
 
-def write_dataframe_to_sheet(sheet, df: pd.DataFrame, data_start_row: int, max_col: int):
+def finalize_sheet_presentation(sheet):
     """
-    Write DataFrame data back to the sheet, preserving formatting where possible.
+    Set sheet to A1 position and collapse all grouped rows/columns before saving.
     """
-    # Clear existing data rows first
-    for row_num in range(data_start_row, sheet.max_row + 1):
-        for col_num in range(1, max_col + 1):
-            sheet.cell(row=row_num, column=col_num).value = None
+    try:
+        # Set active cell to A1
+        sheet.active_cell = "A1"
+        
+        # Set sheet view to show A1 (top-left corner)
+        sheet.sheet_view.topLeftCell = "A1"
+        
+        # Collapse all row groups (outline levels)
+        if hasattr(sheet, 'row_dimensions'):
+            for row_num, row_dim in sheet.row_dimensions.items():
+                if hasattr(row_dim, 'outline_level') and row_dim.outline_level > 0:
+                    row_dim.hidden = True
+        
+        # Collapse all column groups (outline levels)  
+        if hasattr(sheet, 'column_dimensions'):
+            for col_letter, col_dim in sheet.column_dimensions.items():
+                if hasattr(col_dim, 'outline_level') and col_dim.outline_level > 0:
+                    col_dim.hidden = True
+        
+        # Alternative approach: Set outline summary below/right to collapse groups
+        if hasattr(sheet, 'sheet_properties'):
+            if hasattr(sheet.sheet_properties, 'outline_pr'):
+                sheet.sheet_properties.outline_pr.summary_below = False
+                sheet.sheet_properties.outline_pr.summary_right = False
+        
+        logger.info(f"Finalized presentation for sheet: {sheet.title}")
+        
+    except Exception as e:
+        logger.warning(f"Could not finalize presentation for sheet {sheet.title}: {str(e)}")
+        # Don't fail the whole process if presentation cleanup fails
+def write_dataframe_to_sheet(sheet, df: pd.DataFrame, data_start_row: int, data_end_row: int, max_col: int):
+    """
+    Replace existing data rows with filtered DataFrame data by deleting rows and inserting new ones.
+    """
+    # Step 1: Delete all existing data rows (from bottom to top to avoid index shifting)
+    rows_to_delete = data_end_row - data_start_row + 1
+    for i in range(rows_to_delete):
+        sheet.delete_rows(data_start_row)
     
-    # Write new data
+    # Step 2: Insert new rows for the filtered data
     for idx, row in df.iterrows():
         excel_row = data_start_row + idx
+        sheet.insert_rows(excel_row)
+        
+        # Write the data to the new row
         for col_idx, value in enumerate(row):
             if col_idx < max_col:  # Don't exceed original column range
                 sheet.cell(row=excel_row, column=col_idx + 1).value = value
@@ -319,7 +356,7 @@ def process_workbook_by_audit_leaders(source_file: str, output_dir: str = None) 
                 filtered_df, has_dnc = filter_and_sort_data(df, audit_leader, column_mapping)
                 
                 # Write filtered data back to sheet
-                write_dataframe_to_sheet(sheet, filtered_df, data_start_row, max_col)
+                write_dataframe_to_sheet(sheet, filtered_df, data_start_row, data_end_row, max_col)
                 
                 # Set tab color based on DNC presence
                 if has_dnc:
@@ -329,7 +366,12 @@ def process_workbook_by_audit_leaders(source_file: str, output_dir: str = None) 
                     sheet.sheet_properties.tabColor = "00FF00"  # Green
                     logger.info(f"Set {sheet_name} tab color to green (no DNC values)")
             
-            # Step 4: Save the processed workbook
+            # Step 4: Finalize all sheets for better presentation
+            for sheet_name in wb.sheetnames:
+                sheet = wb[sheet_name]
+                finalize_sheet_presentation(sheet)
+            
+            # Step 5: Save the processed workbook
             wb.save(output_path)
             wb.close()
             
