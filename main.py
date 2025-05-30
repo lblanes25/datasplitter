@@ -13,45 +13,62 @@ def is_qa_id_sheet(sheet_name):
         return False
     return sheet_name.upper().startswith('QA-ID-')
 
+def find_data_table_header_row(workbook_path, sheet_name):
+    """Find the header row by looking for 'Detailed Results' in column B, 
+    then finding 'Audit Leader' after it."""
+    try:
+        # Read the sheet without any header assumptions
+        df_no_header = pd.read_excel(workbook_path, sheet_name=sheet_name, header=None)
+        
+        # Column B is index 1 (0-based)
+        col_b = df_no_header.iloc[:, 1] if len(df_no_header.columns) > 1 else pd.Series()
+        
+        detailed_results_row = None
+        audit_leader_row = None
+        
+        # First, find "Detailed Results" in column B
+        for idx, value in col_b.items():
+            if pd.notna(value) and isinstance(value, str):
+                if 'detailed results' in value.lower():
+                    detailed_results_row = idx
+                    print(f"    Found 'Detailed Results' at row {idx + 1}")
+                    break
+        
+        if detailed_results_row is None:
+            print(f"    Could not find 'Detailed Results' in column B")
+            return None
+        
+        # Now find "Audit Leader" after "Detailed Results"
+        for idx in range(detailed_results_row + 1, len(col_b)):
+            value = col_b.iloc[idx] if idx < len(col_b) else None
+            if pd.notna(value) and isinstance(value, str):
+                if value.strip().lower() == 'audit leader':
+                    audit_leader_row = idx
+                    print(f"    Found 'Audit Leader' header at row {idx + 1}")
+                    break
+        
+        if audit_leader_row is None:
+            print(f"    Could not find 'Audit Leader' after 'Detailed Results'")
+            return None
+            
+        return audit_leader_row
+        
+    except Exception as e:
+        print(f"    Error finding header row: {e}")
+        return None
+
 def find_audit_leader_column(df):
-    """Find the column that contains 'Audit Leader' in its name, 
-    with preference for columns in the main data table rather than summary table."""
-    # Check for exact column names first - these are likely in the main data table
-    exact_matches = ['Audit Leader Name', 'Audit Leader Names', 'Audit Lead', 'Audit Leader']
+    """Find the column that contains 'Audit Leader' - should be straightforward now."""
     for col in df.columns:
-        if col in exact_matches:
+        if isinstance(col, str) and col.strip().lower() == 'audit leader':
             return col
     
-    # If no exact matches, check for columns that are both:
-    # 1. Contain "audit leader" or "audit lead"
-    # 2. Are in a row with other common data headers (suggesting it's the main table, not summary)
-    audit_leader_cols = []
-    
+    # Fallback to partial match
     for col in df.columns:
-        if isinstance(col, str) and ('audit leader' in col.lower() or 'audit lead' in col.lower()):
-            audit_leader_cols.append(col)
-    
-    # If we have multiple matches, try to identify the main data table
-    if len(audit_leader_cols) > 1:
-        # Look for columns that appear in rows with other common data headers
-        common_data_headers = ['id', 'date', 'status', 'department', 'project', 'qa', 'finding', 
-                              'risk', 'compliance', 'severity', 'due', 'assign']
-        
-        # Score each column based on how many common data headers appear in the same row
-        col_scores = {}
-        for col in audit_leader_cols:
-            # Check how many other columns in this row contain common data headers
-            other_cols = [c for c in df.columns if c != col]
-            score = sum(1 for c in other_cols if any(header in str(c).lower() for header in common_data_headers))
-            col_scores[col] = score
-        
-        # Return the column with the highest score (most likely to be in the main data table)
-        if col_scores:
-            best_col = max(col_scores.items(), key=lambda x: x[1])[0]
-            return best_col
-    
-    # If only one match or can't determine from context, return the first match
-    return audit_leader_cols[0] if audit_leader_cols else None
+        if isinstance(col, str) and 'audit leader' in col.lower():
+            return col
+            
+    return None
 
 def get_all_audit_leaders(workbook_path):
     """Collect all unique Audit Leaders from QA-ID-XXX sheets only."""
@@ -70,83 +87,28 @@ def get_all_audit_leaders(workbook_path):
         print(f"  Scanning sheet: {sheet_name} for audit leaders")
         
         try:
-            # First, try to find the right header row by searching for patterns
-            # that would indicate the main data table rather than summary tables
-            found_main_data_table = False
+            # Find the header row using our new method
+            header_row_idx = find_data_table_header_row(workbook_path, sheet_name)
             
-            # Try reading different portions of the sheet to find the main data section
-            for skip_rows in [0, 5, 10, 15, 20]:
-                # Read a block of rows, assuming one might contain our header
-                block_df = pd.read_excel(excel_file, sheet_name=sheet_name, 
-                                        header=None, skiprows=skip_rows, nrows=10)
+            if header_row_idx is not None:
+                # Read the data with the identified header row
+                df = pd.read_excel(excel_file, sheet_name=sheet_name, 
+                                  skiprows=header_row_idx, header=0)
                 
-                # For each row in this block, check if it looks like a main data header row
-                for i in range(min(10, len(block_df))):
-                    row = block_df.iloc[i]
-                    
-                    # Count mentions of common data table headers to identify the main data table
-                    common_headers = ['id', 'date', 'status', 'department', 'project', 'qa', 
-                                     'finding', 'risk', 'compliance', 'severity', 'due']
-                    
-                    # Count how many cells in this row contain common header terms
-                    header_matches = 0
-                    audit_leader_idx = None
-                    
-                    for j, cell_value in enumerate(row):
-                        if isinstance(cell_value, str):
-                            cell_lower = cell_value.lower()
-                            # Check for common headers
-                            if any(header in cell_lower for header in common_headers):
-                                header_matches += 1
-                            
-                            # Check for audit leader column
-                            if 'audit' in cell_lower and ('leader' in cell_lower or 'lead' in cell_lower):
-                                audit_leader_idx = j
-                    
-                    # If this row has both audit leader and several other common headers,
-                    # it's likely the main data table header row
-                    if audit_leader_idx is not None and header_matches >= 3:
-                        print(f"  Found main data header row at skiprows={skip_rows}, row={i}, with {header_matches} common headers")
-                        
-                        # Read the sheet with this as the header row
-                        df = pd.read_excel(excel_file, sheet_name=sheet_name, 
-                                          skiprows=skip_rows+i, header=0)
-                        
-                        # Find the audit leader column
-                        leader_col = find_audit_leader_column(df)
-                        
-                        if leader_col:
-                            print(f"  Found main data leader column: {leader_col}")
-                            leaders = df[leader_col].dropna().astype(str).unique()
-                            # Filter out empty strings
-                            leaders = [leader for leader in leaders if leader.strip()]
-                            all_leaders.update(leaders)
-                            print(f"  Added {len(leaders)} leaders from main data table")
-                            found_main_data_table = True
-                            break
-                
-                if found_main_data_table:
-                    break
-            
-            # If we couldn't find the main data table with our heuristic approach,
-            # fall back to the standard method
-            if not found_main_data_table:
-                print(f"  Could not identify main data table, trying standard approach")
-                
-                # Try reading with auto header detection
-                df = pd.read_excel(excel_file, sheet_name=sheet_name)
-                
-                # Find the column with 'Audit Leader' in its name
+                # Find the audit leader column
                 leader_col = find_audit_leader_column(df)
                 
-                # If found, add all non-null leaders to the set
                 if leader_col:
-                    print(f"  Found leader column: {leader_col} in sheet {sheet_name}")
+                    print(f"  Found leader column: {leader_col}")
                     leaders = df[leader_col].dropna().astype(str).unique()
-                    # Filter out empty strings
-                    leaders = [leader for leader in leaders if leader.strip()]
+                    # Filter out empty strings and header text
+                    leaders = [leader for leader in leaders if leader.strip() and leader.strip().lower() != 'audit leader']
                     all_leaders.update(leaders)
-                    print(f"  Added {len(leaders)} leaders from this sheet (standard method)")
+                    print(f"  Added {len(leaders)} leaders: {', '.join(leaders)}")
+                else:
+                    print(f"  Could not find audit leader column in sheet {sheet_name}")
+            else:
+                print(f"  Could not find data table in sheet {sheet_name}")
         
         except Exception as e:
             print(f"  Error processing sheet {sheet_name}: {e}")
@@ -232,219 +194,132 @@ def create_leader_workbook(input_path, output_path, leader_name):
             # Create a new sheet with the same name for each sheet in original workbook
             new_sheet = new_wb.create_sheet(title=sheet_name)
             
-            # Check if this is a QA-ID sheet that we need to filter
-            if is_qa_id_sheet(sheet_name):
-                print(f"    This is a QA-ID sheet - filtering for {leader_name}")
-                
-                # Track if this sheet has DNC results for this leader
-                has_dnc = False
-                
-                # Try to find and filter data for this leader
-                try:
-                    # First, try to find the main data table (not summary tables)
-                    main_data_found = False
+                # Check if this is a QA-ID sheet that we need to filter
+                if is_qa_id_sheet(sheet_name):
+                    print(f"    This is a QA-ID sheet - filtering for {leader_name}")
                     
-                    # Try different starting rows to skip past summary tables
-                    for skiprows in [0, 5, 10, 15, 20]:
-                        # Read a sample to look for header patterns
-                        sample_df = pd.read_excel(input_path, sheet_name=sheet_name, 
-                                                 header=None, skiprows=skiprows, nrows=10)
-                        
-                        for i in range(min(10, len(sample_df))):
-                            row = sample_df.iloc[i]
-                            
-                            # Count how many common data headers we find in this row
-                            common_headers = ['id', 'date', 'status', 'department', 'project', 'qa', 
-                                             'finding', 'risk', 'compliance', 'severity', 'due']
-                            header_count = 0
-                            audit_leader_col = None
-                            qa_results_col = None
-                            
-                            for j, cell_value in enumerate(row):
-                                if isinstance(cell_value, str):
-                                    cell_lower = cell_value.lower()
-                                    # Check for common headers
-                                    if any(header in cell_lower for header in common_headers):
-                                        header_count += 1
-                                    
-                                    # Check for audit leader column
-                                    if 'audit' in cell_lower and ('leader' in cell_lower or 'lead' in cell_lower):
-                                        audit_leader_col = j
-                                    
-                                    # Check for QA Results column
-                                    if 'qa' in cell_lower and 'result' in cell_lower:
-                                        qa_results_col = j
-                            
-                            # If this row has both audit leader and several data headers,
-                            # it's likely our main data table header
-                            if audit_leader_col is not None and header_count >= 3:
-                                print(f"    Found likely main data header at skiprows={skiprows}, row={i}")
-                                
-                                # Read the data with this as the header
-                                header_row_index = skiprows + i
-                                df = pd.read_excel(input_path, sheet_name=sheet_name, 
-                                                  header=header_row_index)
-                                
-                                # Find the audit leader column
-                                leader_col = find_audit_leader_column(df)
-                                
-                                if leader_col:
-                                    print(f"    Using column: {leader_col}")
-                                    
-                                    # Filter for this leader
-                                    filtered_df = filter_data_for_leader(df, leader_col, leader_name)
-                                    
-                                    if not filtered_df.empty:
-                                        print(f"    Found {len(filtered_df)} rows for {leader_name}")
-                                        found_data = True
-                                        main_data_found = True
-                                        
-                                        # Check for QA Results column in the filtered data
-                                        qa_col = None
-                                        for col in filtered_df.columns:
-                                            if isinstance(col, str) and 'qa' in col.lower() and 'result' in col.lower():
-                                                qa_col = col
-                                                break
-                                        
-                                        # If we found a QA Results column, check for DNC values
-                                        if qa_col:
-                                            print(f"    Found QA Results column: {qa_col}")
-                                            # Check if any rows have "DNC" value for this leader
-                                            dnc_rows = filtered_df[filtered_df[qa_col].astype(str).str.lower() == 'dnc']
-                                            if not dnc_rows.empty:
-                                                print(f"    ⚠️ Found {len(dnc_rows)} DNC results in this sheet!")
-                                                has_dnc = True
-                                                sheets_with_dnc.add(sheet_name)
-                                        
-                                        # Copy everything up to the header row from original
-                                        # This preserves any summary tables at the top
-                                        original_sheet = original_wb[sheet_name]
-                                        for row_idx in range(1, header_row_index + 2):  # +2 for 1-indexing and to include header
-                                            row_data = []
-                                            for cell in original_sheet[row_idx]:
-                                                row_data.append(cell.value)
-                                            new_sheet.append(row_data)
-                                        
-                                        # Add the filtered data rows 
-                                        for _, row in filtered_df.iterrows():
-                                            new_sheet.append(row.tolist())
-                                        
-                                        # Apply formatting
-                                        from openpyxl.styles import Font
-                                        bold_font = Font(bold=True)
-                                        
-                                        # Bold the header row
-                                        header_row_idx = header_row_index + 1  # +1 because Excel is 1-indexed
-                                        for cell in new_sheet[header_row_idx]:
-                                            cell.font = bold_font
-                                        
-                                        # Set column widths
-                                        for i in range(1, len(row) + 1):
-                                            new_sheet.column_dimensions[get_column_letter(i)].width = 15
-                                        
-                                        break  # Stop searching for headers in this block
-                                
-                            if main_data_found:
-                                break
-                        
-                        if main_data_found:
-                            break
+                    # Track if this sheet has DNC results for this leader
+                    has_dnc = False
                     
-                    # If main data table wasn't found, try the standard approach
-                    if not main_data_found:
-                        print(f"    Trying standard approach (may include summary tables)")
+                    # Try to find and filter data for this leader
+                    try:
+                        # Find the header row using our new method
+                        header_row_idx = find_data_table_header_row(input_path, sheet_name)
                         
-                        df = pd.read_excel(input_path, sheet_name=sheet_name)
-                        leader_col = find_audit_leader_column(df)
-                        
-                        if leader_col:
-                            print(f"    Found leader column: {leader_col}")
-                            filtered_df = filter_data_for_leader(df, leader_col, leader_name)
+                        if header_row_idx is not None:
+                            print(f"    Found data table header at row {header_row_idx + 1}")
                             
-                            if not filtered_df.empty:
-                                print(f"    Found {len(filtered_df)} rows for {leader_name} (standard method)")
-                                found_data = True
+                            # Read the data with the identified header row
+                            df = pd.read_excel(input_path, sheet_name=sheet_name, 
+                                              skiprows=header_row_idx, header=0)
+                            
+                            # Find the audit leader column
+                            leader_col = find_audit_leader_column(df)
+                            
+                            if leader_col:
+                                print(f"    Using column: {leader_col}")
                                 
-                                # Check for QA Results column in the filtered data
-                                qa_col = None
-                                for col in filtered_df.columns:
-                                    if isinstance(col, str) and 'qa' in col.lower() and 'result' in col.lower():
-                                        qa_col = col
-                                        break
+                                # Filter for this leader
+                                filtered_df = filter_data_for_leader(df, leader_col, leader_name)
                                 
-                                # If we found a QA Results column, check for DNC values
-                                if qa_col:
-                                    print(f"    Found QA Results column: {qa_col}")
-                                    # Check if any rows have "DNC" value for this leader
-                                    dnc_rows = filtered_df[filtered_df[qa_col].astype(str).str.lower() == 'dnc']
-                                    if not dnc_rows.empty:
-                                        print(f"    ⚠️ Found {len(dnc_rows)} DNC results in this sheet!")
-                                        has_dnc = True
-                                        sheets_with_dnc.add(sheet_name)
-                                
-                                # Copy the header row
-                                header_row = df.columns.tolist()
-                                new_sheet.append(header_row)
-                                
-                                # Write data rows
-                                for _, row in filtered_df.iterrows():
-                                    new_sheet.append(row.tolist())
-                                
-                                # Apply formatting
-                                from openpyxl.styles import Font
-                                bold_font = Font(bold=True)
-                                for cell in new_sheet[1]:  # Bold the header row
-                                    cell.font = bold_font
+                                if not filtered_df.empty:
+                                    print(f"    Found {len(filtered_df)} rows for {leader_name}")
+                                    found_data = True
                                     
-                                # Set column widths
-                                for i, _ in enumerate(header_row, 1):
-                                    new_sheet.column_dimensions[get_column_letter(i)].width = 15
+                                    # Check for QA Results column in the filtered data
+                                    qa_col = None
+                                    for col in filtered_df.columns:
+                                        if isinstance(col, str) and 'qa' in col.lower() and 'result' in col.lower():
+                                            qa_col = col
+                                            break
+                                    
+                                    # If we found a QA Results column, check for DNC values
+                                    if qa_col:
+                                        print(f"    Found QA Results column: {qa_col}")
+                                        # Check if any rows have "DNC" value for this leader
+                                        dnc_rows = filtered_df[filtered_df[qa_col].astype(str).str.lower() == 'dnc']
+                                        if not dnc_rows.empty:
+                                            print(f"    ⚠️ Found {len(dnc_rows)} DNC results in this sheet!")
+                                            has_dnc = True
+                                            sheets_with_dnc.add(sheet_name)
+                                    
+                                    # Copy everything up to the header row from original
+                                    # This preserves any summary tables at the top
+                                    original_sheet = original_wb[sheet_name]
+                                    for row_idx in range(1, header_row_idx + 2):  # +2 for 1-indexing and to include header
+                                        row_data = []
+                                        for cell in original_sheet[row_idx]:
+                                            row_data.append(cell.value)
+                                        new_sheet.append(row_data)
+                                    
+                                    # Add the filtered data rows 
+                                    for _, row in filtered_df.iterrows():
+                                        new_sheet.append(row.tolist())
+                                    
+                                    # Apply formatting
+                                    from openpyxl.styles import Font
+                                    bold_font = Font(bold=True)
+                                    
+                                    # Bold the header row
+                                    header_row_idx_excel = header_row_idx + 1  # +1 because Excel is 1-indexed
+                                    for cell in new_sheet[header_row_idx_excel]:
+                                        cell.font = bold_font
+                                    
+                                    # Set column widths
+                                    for i in range(1, len(row) + 1):
+                                        new_sheet.column_dimensions[get_column_letter(i)].width = 15
+                                    
+                                else:
+                                    print(f"    No data found for {leader_name} in sheet {sheet_name}")
+                                    
+                                    # Copy the first part including headers
+                                    original_sheet = original_wb[sheet_name]
+                                    rows_to_copy = min(header_row_idx + 10, len(list(original_sheet.rows)))
+                                    
+                                    for row_idx in range(1, rows_to_copy + 1):
+                                        row_data = []
+                                        for cell in original_sheet[row_idx]:
+                                            row_data.append(cell.value)
+                                        new_sheet.append(row_data)
                             else:
-                                print(f"    No data found for {leader_name} in sheet {sheet_name}")
-                                
-                                # Copy the first 15 rows (likely to include summary tables and headers)
+                                print(f"    Could not find audit leader column")
+                                # Copy structure
                                 original_sheet = original_wb[sheet_name]
-                                rows_to_copy = min(15, len(list(original_sheet.rows)))
+                                rows_to_copy = min(20, len(list(original_sheet.rows)))
                                 
                                 for row_idx in range(1, rows_to_copy + 1):
                                     row_data = []
                                     for cell in original_sheet[row_idx]:
                                         row_data.append(cell.value)
                                     new_sheet.append(row_data)
-                    
-                    # If no specific approach worked, copy the structure of the sheet
-                    if not found_data and not main_data_found:
-                        print(f"    Unable to find data for {leader_name}, copying sheet structure")
+                        else:
+                            print(f"    Could not find data table header")
+                            # Copy structure
+                            original_sheet = original_wb[sheet_name]
+                            rows_to_copy = min(20, len(list(original_sheet.rows)))
+                            
+                            for row_idx in range(1, rows_to_copy + 1):
+                                row_data = []
+                                for cell in original_sheet[row_idx]:
+                                    row_data.append(cell.value)
+                                new_sheet.append(row_data)
                         
-                        # Copy the first part of the sheet to maintain summary tables and headers
+                    except Exception as e:
+                        print(f"    Error processing QA-ID sheet {sheet_name}: {e}")
+                        traceback.print_exc()
+                        
+                        # On error, copy at least part of the sheet to maintain structure
                         original_sheet = original_wb[sheet_name]
-                        
-                        # Determine how much to copy - either the whole sheet if small, or just the top portion
-                        max_rows_to_copy = 20  # Copy up to this many rows to ensure headers are included
-                        rows_to_copy = min(max_rows_to_copy, len(list(original_sheet.rows)))
+                        rows_to_copy = min(15, len(list(original_sheet.rows)))
                         
                         for row_idx in range(1, rows_to_copy + 1):
-                            row_data = []
-                            for cell in original_sheet[row_idx]:
-                                row_data.append(cell.value)
-                            new_sheet.append(row_data)
-                    
-                except Exception as e:
-                    print(f"    Error processing QA-ID sheet {sheet_name}: {e}")
-                    traceback.print_exc()
-                    
-                    # On error, copy at least part of the sheet to maintain structure
-                    original_sheet = original_wb[sheet_name]
-                    rows_to_copy = min(15, len(list(original_sheet.rows)))
-                    
-                    for row_idx in range(1, rows_to_copy + 1):
-                        try:
-                            row_data = []
-                            for cell in original_sheet[row_idx]:
-                                row_data.append(cell.value)
-                            new_sheet.append(row_data)
-                        except:
-                            break  # If we can't copy this row, stop trying
+                            try:
+                                row_data = []
+                                for cell in original_sheet[row_idx]:
+                                    row_data.append(cell.value)
+                                new_sheet.append(row_data)
+                            except:
+                                break  # If we can't copy this row, stop trying
             
             else:
                 # This is NOT a QA-ID sheet - copy it entirely as-is
