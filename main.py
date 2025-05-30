@@ -1,5 +1,6 @@
 import os
 import shutil
+import re
 from pathlib import Path
 import pandas as pd
 import openpyxl
@@ -10,6 +11,11 @@ import logging
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+def sanitize_filename(name: str) -> str:
+    """Clean a string to make it safe for use as a Windows filename."""
+    # Replace invalid characters with underscores
+    return re.sub(r'[<>:"/\\|?*\n\r]+', '_', name).strip()
 
 def find_table_boundaries(sheet, sheet_name: str) -> Optional[Tuple[int, int, int, int]]:
     """
@@ -292,7 +298,8 @@ def process_workbook_by_audit_leaders(source_file: str, output_dir: str = None) 
         
         try:
             # Step 1: Copy the original file
-            output_filename = f"{base_name} - {audit_leader}.xlsx"
+            safe_leader_name = sanitize_filename(audit_leader)
+            output_filename = f"{base_name} - {safe_leader_name}.xlsx"
             output_path = output_dir / output_filename
             shutil.copyfile(source_file, output_path)
             logger.info(f"Created copy: {output_path}")
