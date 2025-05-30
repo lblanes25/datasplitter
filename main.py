@@ -1,4 +1,23 @@
-import os
+def filter_and_sort_data(df: pd.DataFrame, audit_leader: str, column_mapping: Dict[str, int]) -> Tuple[pd.DataFrame, bool]:
+    """
+    Filter data for specific audit leader and sort with DNC values first.
+    
+    Returns:
+        Tuple of (filtered_df, has_dnc_values)
+    """
+    # Filter for the specific audit leader
+    if "Audit Leader" not in column_mapping:
+        logger.error("'Audit Leader' column not found in column mapping")
+        return df, False
+    
+    audit_leader_col = None
+    for col_name in df.columns:
+        if "Audit Leader" in str(col_name):
+            audit_leader_col = col_name
+            break
+    
+    if audit_leader_col is None:
+        logger.error("Could not find Audit Leader column in DataFrame")import os
 import shutil
 import re
 from pathlib import Path
@@ -198,28 +217,38 @@ def filter_and_sort_data(df: pd.DataFrame, audit_leader: str, column_mapping: Di
     if len(filtered_df) == 0:
         return filtered_df, False
     
-    # Look for the specific Overall Test Result column
-    result_col_name = "Overall Test Result (after considering any applicable test result overrides)"
+    # Debug: Print all column names to help identify the exact column
+    logger.info(f"Available columns: {list(filtered_df.columns)}")
     
-    if result_col_name not in filtered_df.columns:
-        logger.warning(f"Could not find '{result_col_name}' column")
-        # Try to find a close match in case of slight variations
-        for col_name in filtered_df.columns:
-            if "Overall Test Result" in str(col_name):
-                result_col_name = col_name
-                logger.info(f"Using column '{result_col_name}' instead")
-                break
-        else:
-            logger.error("No Overall Test Result column found - cannot check for DNC values")
-            return filtered_df, False
+    # Find the Overall Test Result column using positional logic
+    result_col_name = None
     
-    # Check for DNC values in the specific column
+    # Step 1: Find the "Override" column first
+    override_col_index = None
+    for idx, col_name in enumerate(filtered_df.columns):
+        col_lower = str(col_name).lower()
+        if "overall test result override" in col_lower:
+            override_col_index = idx
+            logger.info(f"Found Override column at index {idx}: '{col_name}'")
+            break
+    
+    # Step 2: Get the column immediately to the right
+    if override_col_index is not None and override_col_index + 1 < len(filtered_df.columns):
+        result_col_name = filtered_df.columns[override_col_index + 1]
+        logger.info(f"Using column to the right of Override: '{result_col_name}'")
+    else:
+        logger.error("Could not find Override column or no column to its right")
+        return filtered_df, False
+    
+    # Check for DNC values in the identified column
     has_dnc = False
     if result_col_name in filtered_df.columns:
         dnc_count = filtered_df[result_col_name].astype(str).str.contains("DNC", case=False, na=False).sum()
         if dnc_count > 0:
             has_dnc = True
             logger.info(f"Found {dnc_count} DNC values in '{result_col_name}' column")
+        else:
+            logger.info(f"No DNC values found in '{result_col_name}' column")
     
     # Sort with DNC values first
     if has_dnc:
