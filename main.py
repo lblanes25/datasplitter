@@ -93,27 +93,41 @@ def get_column_mapping(sheet, header_row: int, max_col: int) -> Dict[str, int]:
     logger.info(f"Column mapping: {column_mapping}")
     return column_mapping
 
-def extract_data_to_dataframe(sheet, header_row: int, data_start_row: int, data_end_row: int, max_col: int) -> pd.DataFrame:
+def get_cell_calculated_value(cell):
     """
-    Extract data from the sheet into a pandas DataFrame.
+    Get the calculated value of a cell, handling formulas properly.
     """
+    if cell.data_type == 'f':  # Formula cell
+        # Return the cached calculated value
+        return cell.value
+    else:
+        # Regular value
+        return cell.value
+
+def extract_data_to_dataframe_with_calculated_values(wb_calculated, sheet_name: str, header_row: int, 
+                                                   data_start_row: int, data_end_row: int, max_col: int) -> pd.DataFrame:
+    """
+    Extract data from the sheet into a pandas DataFrame using calculated values.
+    """
+    sheet_calc = wb_calculated[sheet_name]
+    
     # Get headers
     headers = []
     for col_num in range(1, max_col + 1):
-        header_value = sheet.cell(row=header_row, column=col_num).value
+        header_value = sheet_calc.cell(row=header_row, column=col_num).value
         headers.append(str(header_value) if header_value is not None else f"Column_{col_num}")
     
-    # Get data
+    # Get data with calculated values
     data = []
     for row_num in range(data_start_row, data_end_row + 1):
         row_data = []
         for col_num in range(1, max_col + 1):
-            cell_value = sheet.cell(row=row_num, column=col_num).value
+            cell_value = get_cell_calculated_value(sheet_calc.cell(row=row_num, column=col_num))
             row_data.append(cell_value)
         data.append(row_data)
     
     df = pd.DataFrame(data, columns=headers)
-    logger.info(f"Extracted DataFrame with shape {df.shape}")
+    logger.info(f"Extracted DataFrame with calculated values, shape {df.shape}")
     return df
 
 def finalize_sheet_presentation(sheet):
@@ -121,11 +135,13 @@ def finalize_sheet_presentation(sheet):
     Set sheet to A1 position and collapse all grouped rows/columns before saving.
     """
     try:
-        # Set active cell to A1
-        sheet.active_cell = "A1"
-        
         # Set sheet view to show A1 (top-left corner)
         sheet.sheet_view.topLeftCell = "A1"
+        
+        # Set the selection to A1 (proper way to set active cell)
+        if hasattr(sheet.sheet_view, 'selection') and len(sheet.sheet_view.selection) > 0:
+            sheet.sheet_view.selection[0].activeCell = "A1"
+            sheet.sheet_view.selection[0].sqref = "A1"
         
         # Collapse all row groups (outline levels)
         if hasattr(sheet, 'row_dimensions'):
@@ -139,17 +155,18 @@ def finalize_sheet_presentation(sheet):
                 if hasattr(col_dim, 'outline_level') and col_dim.outline_level > 0:
                     col_dim.hidden = True
         
-        # Alternative approach: Set outline summary below/right to collapse groups
-        if hasattr(sheet, 'sheet_properties'):
-            if hasattr(sheet.sheet_properties, 'outline_pr'):
-                sheet.sheet_properties.outline_pr.summary_below = False
-                sheet.sheet_properties.outline_pr.summary_right = False
+        # Set outline summary below/right to collapse groups
+        if hasattr(sheet, 'sheet_properties') and hasattr(sheet.sheet_properties, 'outline_pr'):
+            sheet.sheet_properties.outline_pr.summary_below = False
+            sheet.sheet_properties.outline_pr.summary_right = False
+        
+        # Clear any existing freeze panes
+        sheet.freeze_panes = None
         
         logger.info(f"Finalized presentation for sheet: {sheet.title}")
         
     except Exception as e:
         logger.warning(f"Could not finalize presentation for sheet {sheet.title}: {str(e)}")
-        # Don't fail the whole process if presentation cleanup fails
 
 def get_result_column_number(sheet, header_row: int, max_col: int) -> Optional[int]:
     """Find the result column number using the same logic as before."""
@@ -182,36 +199,35 @@ def get_audit_leader_column_number(column_mapping: Dict[str, int]) -> int:
             return col_num
     raise ValueError("Audit Leader column not found in column mapping")
 
-def sort_sheet_by_audit_leader_and_dnc(sheet, header_row: int, data_start_row: int, data_end_row: int, 
-                                      audit_leader_col: int, result_col_num: int = None):
+def sort_sheet_by_audit_leader_and_dnc(sheet_formula, sheet_calculated, header_row: int, data_start_row: int, 
+                                      data_end_row: int, audit_leader_col: int, result_col_num: int = None):
     """
     Sort all data in the sheet by audit leader first, then DNC within each leader.
-    This groups all rows for each audit leader together, making filtering much faster.
+    Uses calculated values for sorting but writes back to formula sheet.
     """
-    logger.info(f"Sorting sheet by audit leader and DNC...")
+    logger.info(f"Sorting sheet by audit leader and DNC using calculated values...")
     
-    # Read all row data with sort keys
+    # Read all row data with sort keys from both sheets
     all_rows_with_keys = []
     
     for row_num in range(data_start_row, data_end_row + 1):
-        # Read entire row
+        # Read entire row data from formula sheet (what we'll write back)
         row_data = []
-        for col_num in range(1, sheet.max_column + 1):
-            cell_value = sheet.cell(row=row_num, column=col_num).value
+        for col_num in range(1, sheet_formula.max_column + 1):
+            cell_value = sheet_formula.cell(row=row_num, column=col_num).value
             row_data.append(cell_value)
         
-        # Get audit leader for sorting
-        audit_leader = sheet.cell(row=row_num, column=audit_leader_col).value
+        # Get audit leader from calculated sheet for sorting
+        audit_leader = get_cell_calculated_value(sheet_calculated.cell(row=row_num, column=audit_leader_col))
         audit_leader_str = str(audit_leader or "").strip()
         
-        # Get DNC status for secondary sorting
+        # Get DNC status from calculated sheet for secondary sorting
         has_dnc = False
         if result_col_num:
-            result_value = sheet.cell(row=row_num, column=result_col_num).value
+            result_value = get_cell_calculated_value(sheet_calculated.cell(row=row_num, column=result_col_num))
             has_dnc = result_value and "DNC" in str(result_value).upper()
         
         # Create sort key: (audit_leader, not has_dnc)
-        # not has_dnc because we want DNC=True to sort first (False < True)
         sort_key = (audit_leader_str, not has_dnc)
         
         all_rows_with_keys.append((sort_key, row_data))
@@ -222,11 +238,11 @@ def sort_sheet_by_audit_leader_and_dnc(sheet, header_row: int, data_start_row: i
     # Extract just the row data in sorted order
     sorted_data = [row_data for sort_key, row_data in all_rows_with_keys]
     
-    # Write sorted data back to sheet
+    # Write sorted data back to formula sheet
     for idx, row_data in enumerate(sorted_data):
         excel_row = data_start_row + idx
         for col_idx, value in enumerate(row_data):
-            sheet.cell(row=excel_row, column=col_idx + 1).value = value
+            sheet_formula.cell(row=excel_row, column=col_idx + 1).value = value
     
     # Create summary of the sort
     audit_leader_counts = {}
@@ -236,20 +252,19 @@ def sort_sheet_by_audit_leader_and_dnc(sheet, header_row: int, data_start_row: i
     
     logger.info(f"Sorted {len(sorted_data)} rows by audit leader:")
     for leader, count in sorted(audit_leader_counts.items()):
-        if count > 0:  # Only show leaders with data
+        if count > 0:
             logger.info(f"  {leader}: {count} rows")
 
-def find_audit_leader_boundaries(sheet, data_start_row: int, data_end_row: int, 
+def find_audit_leader_boundaries(sheet_calculated, data_start_row: int, data_end_row: int, 
                                 audit_leader_col: int, target_leader: str) -> Tuple[Optional[int], Optional[int]]:
     """
-    Find the start and end rows for a specific audit leader in a sorted sheet.
-    Assumes the sheet has been sorted by audit leader.
+    Find the start and end rows for a specific audit leader using calculated values.
     """
     start_row = None
     end_row = None
     
     for row_num in range(data_start_row, data_end_row + 1):
-        audit_leader = sheet.cell(row=row_num, column=audit_leader_col).value
+        audit_leader = get_cell_calculated_value(sheet_calculated.cell(row=row_num, column=audit_leader_col))
         audit_leader_str = str(audit_leader or "").strip()
         
         if audit_leader_str == target_leader:
@@ -257,7 +272,6 @@ def find_audit_leader_boundaries(sheet, data_start_row: int, data_end_row: int,
                 start_row = row_num
             end_row = row_num
         elif start_row is not None:
-            # We've moved past this audit leader's section
             break
     
     if start_row is None:
@@ -267,51 +281,48 @@ def find_audit_leader_boundaries(sheet, data_start_row: int, data_end_row: int,
     logger.info(f"Found {target_leader} in rows {start_row} to {end_row} ({end_row - start_row + 1} rows)")
     return start_row, end_row
 
-def filter_sheet_by_bulk_delete(sheet, audit_leader: str, data_start_row: int, data_end_row: int, 
-                               audit_leader_col: int, result_col_num: int = None) -> bool:
+def filter_sheet_by_bulk_delete(sheet_formula, sheet_calculated, audit_leader: str, data_start_row: int, 
+                               data_end_row: int, audit_leader_col: int, result_col_num: int = None) -> bool:
     """
-    Filter sheet using bulk deletions after sorting.
-    Much faster than deleting individual rows.
-    
-    Returns:
-        bool: True if any DNC values remain after filtering
+    Filter sheet using bulk deletions after sorting, using calculated values for decisions.
     """
-    # Find where this audit leader's data is located
+    # Find where this audit leader's data is located using calculated values
     leader_start, leader_end = find_audit_leader_boundaries(
-        sheet, data_start_row, data_end_row, audit_leader_col, audit_leader
+        sheet_calculated, data_start_row, data_end_row, audit_leader_col, audit_leader
     )
     
     if leader_start is None:
         # No rows for this audit leader - delete all data
         total_rows = data_end_row - data_start_row + 1
         if total_rows > 0:
-            sheet.delete_rows(data_start_row, total_rows)
+            sheet_formula.delete_rows(data_start_row, total_rows)
             logger.info(f"No data found for {audit_leader} - deleted all {total_rows} data rows")
         return False
     
-    # Check for DNC values in the remaining data
+    # Check for DNC values in the remaining data using calculated values
     has_dnc = False
     if result_col_num:
         for row_num in range(leader_start, leader_end + 1):
-            result_value = sheet.cell(row=row_num, column=result_col_num).value
+            result_value = get_cell_calculated_value(sheet_calculated.cell(row=row_num, column=result_col_num))
             if result_value and "DNC" in str(result_value).upper():
                 has_dnc = True
+                logger.info(f"Found DNC value at row {row_num}: {result_value}")
                 break
     
-    # Perform bulk deletions
+    # Perform bulk deletions on formula sheet
     deletions_made = 0
     
     # Delete everything after this audit leader's data
     rows_after = data_end_row - leader_end
     if rows_after > 0:
-        sheet.delete_rows(leader_end + 1, rows_after)
+        sheet_formula.delete_rows(leader_end + 1, rows_after)
         deletions_made += rows_after
         logger.info(f"Deleted {rows_after} rows after {audit_leader}'s data")
     
     # Delete everything before this audit leader's data
     rows_before = leader_start - data_start_row
     if rows_before > 0:
-        sheet.delete_rows(data_start_row, rows_before)
+        sheet_formula.delete_rows(data_start_row, rows_before)
         deletions_made += rows_before
         logger.info(f"Deleted {rows_before} rows before {audit_leader}'s data")
     
@@ -323,22 +334,19 @@ def filter_sheet_by_bulk_delete(sheet, audit_leader: str, data_start_row: int, d
 
 def analyze_workbook_structure(workbook_path: str) -> Tuple[Set[str], Dict[str, Tuple]]:
     """
-    Analyze workbook structure once to get audit leaders and table boundaries.
-    
-    Returns:
-        Tuple of (audit_leaders_set, sheet_info_dict)
-        where sheet_info_dict maps sheet_name -> (header_row, data_start_row, data_end_row, max_col, column_mapping, result_col_name)
+    Analyze workbook structure using calculated values to get audit leaders and table boundaries.
     """
     audit_leaders = set()
     sheet_info = {}
     
     try:
-        wb = openpyxl.load_workbook(workbook_path, data_only=False)
+        # Load with calculated values for analysis
+        wb_calculated = openpyxl.load_workbook(workbook_path, data_only=True)
         
-        for sheet_name in wb.sheetnames:
+        for sheet_name in wb_calculated.sheetnames:
             if sheet_name.startswith("QA-ID-"):
                 logger.info(f"Analyzing sheet {sheet_name}")
-                sheet = wb[sheet_name]
+                sheet = wb_calculated[sheet_name]
                 
                 # Find table boundaries
                 boundaries = find_table_boundaries(sheet, sheet_name)
@@ -348,23 +356,23 @@ def analyze_workbook_structure(workbook_path: str) -> Tuple[Set[str], Dict[str, 
                 header_row, data_start_row, data_end_row, max_col = boundaries
                 column_mapping = get_column_mapping(sheet, header_row, max_col)
                 
-                # Extract data to identify result column and audit leaders
-                df = extract_data_to_dataframe(sheet, header_row, data_start_row, data_end_row, max_col)
+                # Extract data using calculated values
+                df = extract_data_to_dataframe_with_calculated_values(
+                    wb_calculated, sheet_name, header_row, data_start_row, data_end_row, max_col
+                )
                 
-                # Find the correct result column once
+                # Find the correct result column
                 result_col_name = None
                 target_text = "overall test result (after considering any applicable test result overrides)"
                 
                 for col_name in df.columns:
-                    # Normalize the column name: remove newlines, extra spaces, convert to lowercase
                     normalized_col = ' '.join(str(col_name).replace('\n', ' ').split()).lower()
-                    
                     if normalized_col == target_text:
                         result_col_name = col_name
                         logger.info(f"Found target result column in {sheet_name}: '{col_name}'")
                         break
                 
-                # Fallback: look for column containing key phrases and NOT containing "override"
+                # Fallback search
                 if result_col_name is None:
                     for col_name in df.columns:
                         normalized_col = ' '.join(str(col_name).replace('\n', ' ').split()).lower()
@@ -379,10 +387,10 @@ def analyze_workbook_structure(workbook_path: str) -> Tuple[Set[str], Dict[str, 
                 if result_col_name is None:
                     logger.warning(f"Could not find result column in {sheet_name}")
                 
-                # Store sheet info including the result column for reuse
+                # Store sheet info
                 sheet_info[sheet_name] = (header_row, data_start_row, data_end_row, max_col, column_mapping, result_col_name)
                 
-                # Find Audit Leader column and extract unique values
+                # Find Audit Leader column and extract unique values using calculated values
                 audit_leader_col = None
                 for col_name, col_num in column_mapping.items():
                     if "Audit Leader" in col_name:
@@ -393,12 +401,12 @@ def analyze_workbook_structure(workbook_path: str) -> Tuple[Set[str], Dict[str, 
                     logger.warning(f"Could not find Audit Leader column in {sheet_name}")
                     continue
                 
-                # Extract unique audit leaders from this sheet
+                # Extract unique audit leaders using calculated values
                 for leader_value in df[audit_leader_col].dropna().unique():
                     if str(leader_value).strip():
                         audit_leaders.add(str(leader_value).strip())
         
-        wb.close()
+        wb_calculated.close()
         
     except Exception as e:
         logger.error(f"Error analyzing workbook structure: {str(e)}")
@@ -409,8 +417,7 @@ def analyze_workbook_structure(workbook_path: str) -> Tuple[Set[str], Dict[str, 
 
 def create_presorted_workbook(source_file: str, audit_leaders: set, sheet_info: dict) -> str:
     """
-    Create a workbook sorted by audit leader, then DNC.
-    This replaces the pre_sort_workbook_by_dnc function.
+    Create a workbook sorted by audit leader, then DNC using calculated values for sorting.
     """
     source_path = Path(source_file)
     sorted_filename = f"{source_path.stem}_sorted_by_leader{source_path.suffix}"
@@ -420,25 +427,28 @@ def create_presorted_workbook(source_file: str, audit_leaders: set, sheet_info: 
     shutil.copyfile(source_file, sorted_path)
     logger.info(f"Created pre-sort copy: {sorted_path}")
     
-    # Open and sort each sheet
-    wb = openpyxl.load_workbook(sorted_path, data_only=False)
+    # Open both formula and calculated versions
+    wb_formula = openpyxl.load_workbook(sorted_path, data_only=False)
+    wb_calculated = openpyxl.load_workbook(sorted_path, data_only=True)
     
     for sheet_name, (header_row, data_start_row, data_end_row, max_col, column_mapping, result_col_name) in sheet_info.items():
         logger.info(f"Sorting sheet by audit leader: {sheet_name}")
-        sheet = wb[sheet_name]
+        sheet_formula = wb_formula[sheet_name]
+        sheet_calculated = wb_calculated[sheet_name]
         
         # Get column numbers
         audit_leader_col_num = get_audit_leader_column_number(column_mapping)
-        result_col_num = get_result_column_number(sheet, header_row, max_col)
+        result_col_num = get_result_column_number(sheet_formula, header_row, max_col)
         
-        # Sort by audit leader, then DNC
+        # Sort by audit leader, then DNC using calculated values
         sort_sheet_by_audit_leader_and_dnc(
-            sheet, header_row, data_start_row, data_end_row,
+            sheet_formula, sheet_calculated, header_row, data_start_row, data_end_row,
             audit_leader_col_num, result_col_num
         )
     
-    wb.save(sorted_path)
-    wb.close()
+    wb_formula.save(sorted_path)
+    wb_formula.close()
+    wb_calculated.close()
     logger.info(f"Pre-sorted workbook saved: {sorted_path}")
     
     return str(sorted_path)
@@ -446,14 +456,7 @@ def create_presorted_workbook(source_file: str, audit_leaders: set, sheet_info: 
 def process_workbook_by_audit_leaders(source_file: str, output_dir: str = None) -> Dict[str, str]:
     """
     Process an Excel workbook to create filtered versions for each audit leader.
-    Optimized approach: Sort by audit leader first, then use bulk deletions for filtering.
-    
-    Args:
-        source_file: Path to the source Excel file
-        output_dir: Directory to save output files (defaults to same directory as source)
-    
-    Returns:
-        Dictionary mapping audit leader names to output file paths
+    Now properly handles formula cells by using calculated values for decisions.
     """
     source_path = Path(source_file)
     if not source_path.exists():
@@ -467,8 +470,8 @@ def process_workbook_by_audit_leaders(source_file: str, output_dir: str = None) 
     
     base_name = source_path.stem
     
-    # Step 1: Analyze workbook structure
-    logger.info("Analyzing workbook structure...")
+    # Step 1: Analyze workbook structure using calculated values
+    logger.info("Analyzing workbook structure with calculated values...")
     audit_leaders, sheet_info = analyze_workbook_structure(source_file)
     
     if not audit_leaders:
@@ -479,72 +482,75 @@ def process_workbook_by_audit_leaders(source_file: str, output_dir: str = None) 
         logger.warning("No QA-ID sheets with valid table structure found")
         return {}
     
-    # Step 2: Create pre-sorted workbook (sorted by audit leader, then DNC)
+    # Step 2: Create pre-sorted workbook
     logger.info("Pre-sorting workbook by audit leader and DNC values...")
     sorted_workbook_path = create_presorted_workbook(source_file, audit_leaders, sheet_info)
     
     results = {}
     
-    # Step 3: Process each audit leader using the pre-sorted workbook
+    # Step 3: Process each audit leader
     for audit_leader in sorted(audit_leaders):
         logger.info(f"Processing workbook for audit leader: {audit_leader}")
         
         try:
-            # Copy the pre-sorted file (not the original)
+            # Copy the pre-sorted file
             safe_leader_name = sanitize_filename(audit_leader)
             output_filename = f"{base_name} - {safe_leader_name}.xlsx"
             output_path = output_dir / output_filename
             shutil.copyfile(sorted_workbook_path, output_path)
             logger.info(f"Created copy from pre-sorted file: {output_path}")
             
-            # Open the copied file
-            wb = openpyxl.load_workbook(output_path, data_only=False)
+            # Open both formula and calculated versions
+            wb_formula = openpyxl.load_workbook(output_path, data_only=False)
+            wb_calculated = openpyxl.load_workbook(output_path, data_only=True)
             
-            # CRITICAL: Disable auto-calculation to speed up row deletions
+            # Disable auto-calculation for speed
             try:
-                wb.calculation.calcMode = 'manual'
+                wb_formula.calculation.calcMode = 'manual'
                 logger.info("Disabled automatic calculation for faster processing")
             except Exception as e:
                 logger.warning(f"Could not disable calculation mode: {e}")
             
-            # Process each QA-ID sheet using bulk deletion
+            # Process each QA-ID sheet
             for sheet_name, (header_row, data_start_row, data_end_row, max_col, column_mapping, result_col_name) in sheet_info.items():
                 logger.info(f"Filtering sheet: {sheet_name}")
-                sheet = wb[sheet_name]
+                sheet_formula = wb_formula[sheet_name]
+                sheet_calculated = wb_calculated[sheet_name]
                 
                 # Get column numbers
                 audit_leader_col_num = get_audit_leader_column_number(column_mapping)
-                result_col_num = get_result_column_number(sheet, header_row, max_col)
+                result_col_num = get_result_column_number(sheet_formula, header_row, max_col)
                 
-                # Filter using bulk deletion (MUCH faster than individual row deletion)
+                # Filter using calculated values for decisions
                 has_dnc = filter_sheet_by_bulk_delete(
-                    sheet, audit_leader, data_start_row, data_end_row, 
+                    sheet_formula, sheet_calculated, audit_leader, data_start_row, data_end_row, 
                     audit_leader_col_num, result_col_num
                 )
                 
                 # Set tab color based on DNC presence
                 if has_dnc:
-                    sheet.sheet_properties.tabColor = "FF0000"  # Red
+                    sheet_formula.sheet_properties.tabColor = "FF0000"  # Red
                     logger.info(f"Set {sheet_name} tab color to red (DNC values present)")
                 else:
-                    sheet.sheet_properties.tabColor = "00FF00"  # Green
+                    sheet_formula.sheet_properties.tabColor = "00FF00"  # Green
                     logger.info(f"Set {sheet_name} tab color to green (no DNC values)")
             
-            # Re-enable calculation before finalizing
+            # Re-enable calculation
             try:
-                wb.calculation.calcMode = 'automatic'
+                wb_formula.calculation.calcMode = 'automatic'
                 logger.info("Re-enabled automatic calculation")
             except Exception as e:
                 logger.warning(f"Could not re-enable calculation mode: {e}")
             
             # Finalize all sheets
-            for sheet_name in wb.sheetnames:
-                sheet = wb[sheet_name]
+            for sheet_name in wb_formula.sheetnames:
+                sheet = wb_formula[sheet_name]
                 finalize_sheet_presentation(sheet)
             
-            # Save the processed workbook
-            wb.save(output_path)
-            wb.close()
+            # Save and close
+            wb_formula.save(output_path)
+            wb_formula.close()
+            wb_calculated.close()
             
             results[audit_leader] = str(output_path)
             logger.info(f"Successfully processed workbook for {audit_leader}")
@@ -554,7 +560,7 @@ def process_workbook_by_audit_leaders(source_file: str, output_dir: str = None) 
             if output_path.exists():
                 output_path.unlink()
     
-    # Step 4: Clean up the temporary pre-sorted file
+    # Clean up temporary file
     try:
         Path(sorted_workbook_path).unlink()
         logger.info("Cleaned up temporary pre-sorted file")
@@ -566,7 +572,6 @@ def process_workbook_by_audit_leaders(source_file: str, output_dir: str = None) 
 
 # Example usage
 if __name__ == "__main__":
-    # Example usage
     source_file = "your_workbook.xlsx"
     output_directory = "output_files"
     
