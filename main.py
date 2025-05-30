@@ -320,7 +320,6 @@ def create_leader_workbook(input_path, output_path, leader_name):
                                 new_sheet.append(row_data)
                             except:
                                 break  # If we can't copy this row, stop trying
-            
             else:
                 # This is NOT a QA-ID sheet - copy it entirely as-is
                 print(f"    This is not a QA-ID sheet - copying entirely")
