@@ -155,30 +155,35 @@ def filter_and_sort_data(df: pd.DataFrame, audit_leader: str, column_mapping: Di
     if len(filtered_df) == 0:
         return filtered_df, False
     
-    # Check for DNC values and sort
+    # Look for the specific Overall Test Result column
+    result_col_name = "Overall Test Result (after considering any applicable test result overrides)"
+    
+    if result_col_name not in filtered_df.columns:
+        logger.warning(f"Could not find '{result_col_name}' column")
+        # Try to find a close match in case of slight variations
+        for col_name in filtered_df.columns:
+            if "Overall Test Result" in str(col_name):
+                result_col_name = col_name
+                logger.info(f"Using column '{result_col_name}' instead")
+                break
+        else:
+            logger.error("No Overall Test Result column found - cannot check for DNC values")
+            return filtered_df, False
+    
+    # Check for DNC values in the specific column
     has_dnc = False
-    qa_result_cols = []
-    
-    # Find QA Result and Override Result columns
-    for col_name in filtered_df.columns:
-        if any(keyword in str(col_name) for keyword in ["QA Result", "Override Result"]):
-            qa_result_cols.append(col_name)
-    
-    # Check for DNC values
-    for col_name in qa_result_cols:
-        if col_name in filtered_df.columns:
-            dnc_count = filtered_df[col_name].astype(str).str.contains("DNC", case=False, na=False).sum()
-            if dnc_count > 0:
-                has_dnc = True
-                logger.info(f"Found {dnc_count} DNC values in column {col_name}")
+    if result_col_name in filtered_df.columns:
+        dnc_count = filtered_df[result_col_name].astype(str).str.contains("DNC", case=False, na=False).sum()
+        if dnc_count > 0:
+            has_dnc = True
+            logger.info(f"Found {dnc_count} DNC values in '{result_col_name}' column")
     
     # Sort with DNC values first
-    if qa_result_cols and has_dnc:
+    if has_dnc:
         # Create a sort key that prioritizes DNC values
         def sort_key(row):
-            for col_name in qa_result_cols:
-                if col_name in row and "DNC" in str(row[col_name]):
-                    return 0  # DNC values get priority
+            if result_col_name in row and "DNC" in str(row[result_col_name]):
+                return 0  # DNC values get priority
             return 1  # Non-DNC values come after
         
         filtered_df['_sort_key'] = filtered_df.apply(sort_key, axis=1)
@@ -187,18 +192,23 @@ def filter_and_sort_data(df: pd.DataFrame, audit_leader: str, column_mapping: Di
     
     return filtered_df, has_dnc
 
-def get_unique_audit_leaders(workbook_path: str) -> Set[str]:
+def analyze_workbook_structure(workbook_path: str) -> Tuple[Set[str], Dict[str, Tuple]]:
     """
-    Extract all unique audit leaders from QA-ID sheets in the workbook.
+    Analyze workbook structure once to get audit leaders and table boundaries.
+    
+    Returns:
+        Tuple of (audit_leaders_set, sheet_info_dict)
+        where sheet_info_dict maps sheet_name -> (header_row, data_start_row, data_end_row, max_col, column_mapping)
     """
     audit_leaders = set()
+    sheet_info = {}
     
     try:
         wb = openpyxl.load_workbook(workbook_path, data_only=False)
         
         for sheet_name in wb.sheetnames:
             if sheet_name.startswith("QA-ID-"):
-                logger.info(f"Scanning sheet {sheet_name} for audit leaders")
+                logger.info(f"Analyzing sheet {sheet_name}")
                 sheet = wb[sheet_name]
                 
                 # Find table boundaries
@@ -208,6 +218,9 @@ def get_unique_audit_leaders(workbook_path: str) -> Set[str]:
                 
                 header_row, data_start_row, data_end_row, max_col = boundaries
                 column_mapping = get_column_mapping(sheet, header_row, max_col)
+                
+                # Store sheet info for reuse
+                sheet_info[sheet_name] = (header_row, data_start_row, data_end_row, max_col, column_mapping)
                 
                 # Find Audit Leader column
                 audit_leader_col = None
@@ -229,10 +242,11 @@ def get_unique_audit_leaders(workbook_path: str) -> Set[str]:
         wb.close()
         
     except Exception as e:
-        logger.error(f"Error extracting audit leaders: {str(e)}")
+        logger.error(f"Error analyzing workbook structure: {str(e)}")
     
     logger.info(f"Found unique audit leaders: {sorted(audit_leaders)}")
-    return audit_leaders
+    logger.info(f"Analyzed {len(sheet_info)} QA-ID sheets")
+    return audit_leaders, sheet_info
 
 def process_workbook_by_audit_leaders(source_file: str, output_dir: str = None) -> Dict[str, str]:
     """
@@ -258,17 +272,21 @@ def process_workbook_by_audit_leaders(source_file: str, output_dir: str = None) 
     # Get the base filename without extension
     base_name = source_path.stem
     
-    # Extract all unique audit leaders
-    logger.info("Extracting unique audit leaders from workbook...")
-    audit_leaders = get_unique_audit_leaders(source_file)
+    # OPTIMIZATION: Analyze workbook structure once
+    logger.info("Analyzing workbook structure...")
+    audit_leaders, sheet_info = analyze_workbook_structure(source_file)
     
     if not audit_leaders:
         logger.warning("No audit leaders found in the workbook")
         return {}
     
+    if not sheet_info:
+        logger.warning("No QA-ID sheets with valid table structure found")
+        return {}
+    
     results = {}
     
-    # Process each audit leader
+    # Process each audit leader using pre-analyzed structure
     for audit_leader in sorted(audit_leaders):
         logger.info(f"Processing workbook for audit leader: {audit_leader}")
         
@@ -282,37 +300,27 @@ def process_workbook_by_audit_leaders(source_file: str, output_dir: str = None) 
             # Step 2: Open the copied file
             wb = openpyxl.load_workbook(output_path, data_only=False)
             
-            # Step 3: Process each QA-ID sheet
-            for sheet_name in wb.sheetnames:
-                if sheet_name.startswith("QA-ID-"):
-                    logger.info(f"Processing sheet: {sheet_name}")
-                    sheet = wb[sheet_name]
-                    
-                    # Find table boundaries
-                    boundaries = find_table_boundaries(sheet, sheet_name)
-                    if boundaries is None:
-                        logger.warning(f"Skipping sheet {sheet_name} - could not find table boundaries")
-                        continue
-                    
-                    header_row, data_start_row, data_end_row, max_col = boundaries
-                    column_mapping = get_column_mapping(sheet, header_row, max_col)
-                    
-                    # Extract data to DataFrame
-                    df = extract_data_to_dataframe(sheet, header_row, data_start_row, data_end_row, max_col)
-                    
-                    # Filter and sort data
-                    filtered_df, has_dnc = filter_and_sort_data(df, audit_leader, column_mapping)
-                    
-                    # Write filtered data back to sheet
-                    write_dataframe_to_sheet(sheet, filtered_df, data_start_row, max_col)
-                    
-                    # Set tab color based on DNC presence
-                    if has_dnc:
-                        sheet.sheet_properties.tabColor = "FF0000"  # Red
-                        logger.info(f"Set {sheet_name} tab color to red (DNC values present)")
-                    else:
-                        sheet.sheet_properties.tabColor = "00FF00"  # Green
-                        logger.info(f"Set {sheet_name} tab color to green (no DNC values)")
+            # Step 3: Process each QA-ID sheet using pre-analyzed info
+            for sheet_name, (header_row, data_start_row, data_end_row, max_col, column_mapping) in sheet_info.items():
+                logger.info(f"Processing sheet: {sheet_name}")
+                sheet = wb[sheet_name]
+                
+                # Extract data to DataFrame using known boundaries
+                df = extract_data_to_dataframe(sheet, header_row, data_start_row, data_end_row, max_col)
+                
+                # Filter and sort data
+                filtered_df, has_dnc = filter_and_sort_data(df, audit_leader, column_mapping)
+                
+                # Write filtered data back to sheet
+                write_dataframe_to_sheet(sheet, filtered_df, data_start_row, max_col)
+                
+                # Set tab color based on DNC presence
+                if has_dnc:
+                    sheet.sheet_properties.tabColor = "FF0000"  # Red
+                    logger.info(f"Set {sheet_name} tab color to red (DNC values present)")
+                else:
+                    sheet.sheet_properties.tabColor = "00FF00"  # Green
+                    logger.info(f"Set {sheet_name} tab color to green (no DNC values)")
             
             # Step 4: Save the processed workbook
             wb.save(output_path)
