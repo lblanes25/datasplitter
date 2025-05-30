@@ -245,9 +245,21 @@ def filter_rows_by_audit_leader(sheet, audit_leader: str, data_start_row: int, d
             # This row doesn't match - mark for deletion
             rows_to_delete.append(row_num)
     
+    logger.info(f"Found {len(rows_to_delete)} rows to delete for audit leader: {audit_leader}")
+    
     # Delete non-matching rows (from bottom to top to avoid index shifting)
-    for row_num in reversed(rows_to_delete):
-        sheet.delete_rows(row_num)
+    # Process in batches to show progress for large deletions
+    batch_size = 50
+    total_deleted = 0
+    
+    for i in range(0, len(rows_to_delete), batch_size):
+        batch = rows_to_delete[i:i + batch_size]
+        for row_num in reversed(batch):  # Still delete from bottom to top within batch
+            sheet.delete_rows(row_num)
+            total_deleted += 1
+        
+        if len(rows_to_delete) > batch_size:
+            logger.info(f"Deleted {total_deleted}/{len(rows_to_delete)} rows...")
     
     logger.info(f"Filtered sheet: deleted {len(rows_to_delete)} non-matching rows, DNC remaining: {has_dnc_remaining}")
     return has_dnc_remaining
@@ -434,6 +446,13 @@ def process_workbook_by_audit_leaders(source_file: str, output_dir: str = None) 
             # Open the copied file
             wb = openpyxl.load_workbook(output_path, data_only=False)
             
+            # CRITICAL: Disable auto-calculation to speed up row deletions
+            try:
+                wb.calculation.calcMode = 'manual'
+                logger.info("Disabled automatic calculation for faster processing")
+            except Exception as e:
+                logger.warning(f"Could not disable calculation mode: {e}")
+            
             # Process each QA-ID sheet (simple filtering only)
             for sheet_name, (header_row, data_start_row, data_end_row, max_col, column_mapping, result_col_name) in sheet_info.items():
                 logger.info(f"Filtering sheet: {sheet_name}")
@@ -456,6 +475,13 @@ def process_workbook_by_audit_leaders(source_file: str, output_dir: str = None) 
                 else:
                     sheet.sheet_properties.tabColor = "00FF00"  # Green
                     logger.info(f"Set {sheet_name} tab color to green (no DNC values)")
+            
+            # Re-enable calculation before finalizing
+            try:
+                wb.calculation.calcMode = 'automatic'
+                logger.info("Re-enabled automatic calculation")
+            except Exception as e:
+                logger.warning(f"Could not re-enable calculation mode: {e}")
             
             # Finalize all sheets
             for sheet_name in wb.sheetnames:
